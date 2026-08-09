@@ -76,6 +76,18 @@ const tool_schema_t g_tools[] = {
     {"ask_user",
      "Ask the user a question when you need clarification or decisions",
      "{\"type\":\"object\",\"properties\":{\"question\":{\"type\":\"string\"}},\"required\":[\"question\"]}"},
+    {"speak",
+     "Speak text aloud through the phone speaker (Termux TTS). Use when you want to actually talk to the user instead of only writing text.",
+     "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"rate\":{\"type\":\"integer\",\"default\":150}},\"required\":[\"text\"]}"},
+    {"notify",
+     "Send a notification to the phone status bar (Termux:API). Use to alert the user when a long task finishes or something needs their attention.",
+     "{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"},\"content\":{\"type\":\"string\",\"default\":\"\"}},\"required\":[\"title\"]}"},
+    {"vibrate",
+     "Vibrate the phone for a duration in milliseconds.",
+     "{\"type\":\"object\",\"properties\":{\"duration_ms\":{\"type\":\"integer\",\"default\":500}}}"},
+    {"battery",
+     "Report phone battery status (level, charging state, health, temperature) as JSON.",
+     "{\"type\":\"object\",\"properties\":{}}"},
 };
 
 const int g_n_tools = (int)(sizeof(g_tools) / sizeof(g_tools[0]));
@@ -657,6 +669,148 @@ static char *t_find(const jval_t *args) {
     return out;
 }
 
+/* ---------------- Termux:API tools (phone integration) ----
+ * Shell out to the termux-api binaries (pkg install termux-api). Every
+ * command runs via execv — no shell involved, so argument quoting is
+ * never an issue. Captures stdout/stderr; returns a heap result string
+ * ("ERROR:" prefix marks failures so the model sees them). */
+/* resolve a bare binary name through $PATH (access() doesn't search PATH,
+   so a bare-name precheck would false-negative even when installed) */
+static int termux_find(const char *name, char *out, size_t n) {
+    if (strchr(name, '/')) {
+        if (access(name, X_OK) != 0) return 0;
+        snprintf(out, n, "%s", name);
+        return 1;
+    }
+    const char *path = getenv("PATH");
+    if (!path) path = "/data/data/com.termux/files/usr/bin:/usr/bin:/bin";
+    const char *p = path;
+    while (p && *p) {
+        const char *colon = strchr(p, ':');
+        size_t plen = colon ? (size_t)(colon - p) : strlen(p);
+        if (plen > 0 && plen + strlen(name) + 2 < n) {
+            memcpy(out, p, plen);
+            out[plen] = '/';
+            strcpy(out + plen + 1, name);
+            if (access(out, X_OK) == 0) return 1;
+        }
+        p = colon ? colon + 1 : NULL;
+    }
+    return 0;
+}
+
+static char *termux_exec(char *const argv[], int timeout_s) {
+    static char resolved[4096];
+    if (!termux_find(argv[0], resolved, sizeof(resolved)))
+        return fmt("ERROR: '%s' not found — install it with: pkg install termux-api", argv[0]);
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return fmt("ERROR: pipe: %s", strerror(errno));
+    pid_t pid = fork();
+    if (pid < 0) return fmt("ERROR: fork: %s", strerror(errno));
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], 1);
+        dup2(pipefd[1], 2);
+        close(pipefd[1]);
+        execv(resolved, argv);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    char *cap = malloc(16384);
+    size_t ccap = 0;
+    char buf[4096];
+    struct pollfd pfd = { pipefd[0], POLLIN, 0 };
+    double deadline = (double)time(NULL) + (timeout_s > 0 ? timeout_s : 30);
+    int timed_out = 0;
+    for (;;) {
+        double now = (double)time(NULL);
+        int remaining = now >= deadline ? 0 : (int)(deadline - now);
+        int pr = poll(&pfd, 1, remaining * 1000);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) { timed_out = 1; break; }
+        ssize_t n = read(pipefd[0], buf, sizeof(buf));
+        if (n <= 0) break;
+        if (ccap + (size_t)n < 16384) { memcpy(cap + ccap, buf, (size_t)n); ccap += (size_t)n; }
+    }
+    close(pipefd[0]);
+    int status = 0;
+    if (timed_out) { kill(pid, SIGKILL); waitpid(pid, NULL, 0); status = -1; }
+    else waitpid(pid, &status, 0);
+    cap[ccap] = 0;
+    while (ccap > 0 && (cap[ccap-1] == '\n' || cap[ccap-1] == '\r' || cap[ccap-1] == ' ')) cap[--ccap] = 0;
+    char *res;
+    if (timed_out)
+        res = fmt("ERROR: %s timed out", argv[0]);
+    else if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        res = (cap[0]) ? xstrdup(cap) : fmt("✓ %s", argv[0]);
+    else if (WIFEXITED(status))
+        res = fmt("ERROR: %s exited %d%s%s", argv[0], WEXITSTATUS(status),
+                  cap[0] ? ": " : "", cap);
+    else
+        res = fmt("ERROR: %s %s", argv[0], WIFSIGNALED(status) ? "killed by signal" : "failed");
+    free(cap);
+    return res;
+}
+
+static char *t_speak(const jval_t *args) {
+    const char *text = json_str(json_obj_get(args, "text"));
+    if (!text[0]) return xstrdup("ERROR: text is required");
+    double rate = json_num(json_obj_get(args, "rate"));
+    char ratebuf[32];
+    char *argv[6];
+    int ai = 0;
+    argv[ai++] = (char *)"termux-tts-speak";
+    if (rate > 0) {
+        snprintf(ratebuf, sizeof(ratebuf), "%.0f", rate);
+        argv[ai++] = (char *)"-r";
+        argv[ai++] = ratebuf;
+    }
+    argv[ai++] = (char *)text;
+    argv[ai] = NULL;
+    char *r = termux_exec(argv, 30);
+    if (r && strncmp(r, "ERROR:", 6) == 0) return r;
+    free(r);
+    return fmt("✓ speaking: %.60s%s", text, strlen(text) > 60 ? "…" : "");
+}
+
+static char *t_notify(const jval_t *args) {
+    const char *title = json_str(json_obj_get(args, "title"));
+    const char *content = json_str(json_obj_get(args, "content"));
+    if (!title[0]) return xstrdup("ERROR: title is required");
+    char *argv[6];
+    int ai = 0;
+    argv[ai++] = (char *)"termux-notification";
+    argv[ai++] = (char *)"--title";
+    argv[ai++] = (char *)title;
+    if (content[0]) {
+        argv[ai++] = (char *)"--content";
+        argv[ai++] = (char *)content;
+    }
+    argv[ai] = NULL;
+    char *r = termux_exec(argv, 15);
+    if (r && strncmp(r, "ERROR:", 6) == 0) return r;
+    free(r);
+    return fmt("✓ notification sent: %s", title);
+}
+
+static char *t_vibrate(const jval_t *args) {
+    double ms = json_num(json_obj_get(args, "duration_ms"));
+    if (ms <= 0) ms = 500;
+    char msbuf[32];
+    snprintf(msbuf, sizeof(msbuf), "%.0f", ms);
+    char *argv[] = { (char *)"termux-vibrate", (char *)"-d", msbuf, NULL };
+    char *r = termux_exec(argv, 15);
+    if (r && strncmp(r, "ERROR:", 6) == 0) return r;
+    free(r);
+    return fmt("✓ vibrated for %.0f ms", ms);
+}
+
+static char *t_battery(const jval_t *args) {
+    (void)args;
+    char *argv[] = { (char *)"termux-battery-status", NULL };
+    return termux_exec(argv, 15);   /* the raw JSON status is the result */
+}
+
 /* ---------------- dispatch ---------------- */
 
 
@@ -685,6 +839,10 @@ int tool_dispatch(const char *name, const char *args_json, char **result) {
     else if (strcmp(name, "write_diary") == 0) r = t_write_diary(args);
     else if (strcmp(name, "read_diary") == 0) r = t_read_diary(args);
     else if (strcmp(name, "ask_user") == 0) r = tools_ask_user(json_str(json_obj_get(args, "question")));
+    else if (strcmp(name, "speak") == 0) r = t_speak(args);
+    else if (strcmp(name, "notify") == 0) r = t_notify(args);
+    else if (strcmp(name, "vibrate") == 0) r = t_vibrate(args);
+    else if (strcmp(name, "battery") == 0) r = t_battery(args);
     else r = fmt("ERROR: unknown tool '%s'", name);
     json_free(args);
     if (!r) r = xstrdup("(no output)");
