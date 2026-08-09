@@ -343,25 +343,6 @@ int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
             snprintf(nm, sizeof(nm), "blk.%d.ssm_out.weight", il);    FIND_T(m->layers[il].ssm_out, m->layers[il].t_out, nm);
         }
     }
-    fprintf(stderr, "[types] L0 wqkv=%u wv=%u down_exps=%u down_shexp=%u | L5 wqkv=%u wv=%u\n",
-            m->layers[0].t_wqkv, m->layers[0].t_wv, m->layers[0].t_down_exps, m->layers[0].t_down_shexp,
-            m->layers[5].t_wqkv, m->layers[5].t_wv);
-    {   /* sanity: first bytes of L0 conv1d */
-        const float *cw = (const float *)m->layers[0].ssm_conv1d;
-        fprintf(stderr, "[conv0] engine sees w[0..3]: %g %g %g %g\n", cw[0], cw[1], cw[2], cw[3]);
-    }
-    {   /* sanity: first bytes of L0 wqkv as seen by the engine */
-        const unsigned char *p = m->layers[0].wqkv;
-        fprintf(stderr, "[wqkv0] engine sees: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);
-        for (uint32_t i = 0; i < m->n_tensors; i++)
-            if (strcmp(m->tensors[i].name, "blk.0.ffn_gate_exps.weight") == 0) {
-                fprintf(stderr, "[gateexps0] tensor off=%zu type=%u ne=[%lld %lld %lld] nbytes=%llu\n",
-                        m->tensors[i].off, m->tensors[i].type,
-                        (long long)m->tensors[i].ne[0], (long long)m->tensors[i].ne[1], (long long)m->tensors[i].ne[2],
-                        (unsigned long long)m->tensors[i].nbytes);
-            }
-    }
     #undef FIND
     #undef FIND_T
 
