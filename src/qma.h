@@ -164,6 +164,7 @@ typedef struct {
 typedef struct {
     /* mmap */
     int      fd;
+    int      dio_fd;   /* >= 0: O_DIRECT fd for expert reads (4K-aligned file) */
     uint8_t *map;
     size_t   map_size;
     uint8_t *data;      /* start of tensor data section */
@@ -363,5 +364,13 @@ float    qma_q8k_dot(const void *row, int wtype, const int8_t *xq,
 void     qma_q8k_gateup(const void *g, const void *u, const int8_t *xq,
                            const float *xd, const int16_t *xsum, int n,
                            float *gate, float *up);
+
+/* one-time model alignment (see gguf.c): 1 = needs 4K repack, 0 = aligned,
+   -1 = error */
+int      qma_model_needs_align(const char *path, char *err, size_t errlen);
+/* ensure O_DIRECT-able file: repacks to <src>.4k if needed; *use_path gets
+   the file to load (== src when already aligned) */
+int      qma_align_model(const char *src, char *use_path, size_t use_len,
+                           char *err, size_t errlen);
 
 #endif /* QMA_H */

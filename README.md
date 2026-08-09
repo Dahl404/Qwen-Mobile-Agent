@@ -118,8 +118,8 @@ qma -p "prompt"            one-shot, non-interactive
 | `-p <prompt>` | run one prompt and exit, instead of an interactive session |
 | `-t <n>` | number of threads (default 8) |
 | `-c <n>` | ring context size in tokens (default 65536) |
-| `--temp <f>` | sampling temperature (default 0.7) |
-| `--repeat <f>` | repeat penalty (default 1.05) |
+| `--temp <f>` | sampling temperature (default 1.0) |
+| `--repeat <f>` | repeat penalty (default 1.1) |
 | `--eos-penalty <f>` | penalty applied to control-token logits (default 5.0) |
 | `--no-think` | turn off the model's `<think>` block |
 | `--ecache <mb>` | expert cache size in MB (default 1024; `0` uses mmap instead) |

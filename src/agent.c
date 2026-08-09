@@ -38,13 +38,14 @@ static const char *DEFAULT_MODEL = "/data/data/com.termux/files/home/projects/mo
 
 /* ---- config ---- */
 static int g_threads = 8, g_ctx = 65536, g_prefetch = 4;
-static float g_temp = 0.7f, g_top_p = 0.95f, g_repeat = 1.05f;
+static float g_temp = 1.0f, g_top_p = 0.95f, g_repeat = 1.1f;
 static int g_top_k = 20;
 static float g_eos_penalty = 5.0f;
 static int g_enable_thinking = 1;
 static int g_ecache_mb = 1024;
 static int g_use_color = 0;
 static int g_reset = 0;
+static int g_check_align = 0;
 
 static double now_s2(void) {
     struct timespec ts;
@@ -378,6 +379,23 @@ static void resolve_model_path(int from_cli) {
         }
         fprintf(stderr, "qma: model not found: %s — try again\n", cand);
         have = 0;
+    }
+
+    /* one-time: repack the model with 4K-aligned tensor starts so expert
+       reads can use O_DIRECT (see gguf.c). The aligned copy lives next to
+       the original (<model>.4k) and the config is updated to point at it.
+       Skipped with QMA_NOALIGN=1; falls back to the unaligned file when
+       there isn't room. */
+    if (!g_check_align && getenv("QMA_NOALIGN") == NULL) {
+        char aligned[4096];
+        char aerr[512];
+        if (qma_align_model(cand, aligned, sizeof(aligned), aerr, sizeof(aerr)) == 0) {
+            if (strcmp(aligned, cand) != 0)
+                fprintf(stderr, "qma: using aligned model %s\n", aligned);
+            snprintf(cand, sizeof(cand), "%s", aligned);
+        } else if (aerr[0]) {
+            fprintf(stderr, "qma: model alignment skipped: %s\n", aerr);
+        }
     }
 
     snprintf(g_model_path_buf, sizeof(g_model_path_buf), "%s", cand);
@@ -927,10 +945,11 @@ static void usage(const char *prog) {
         "  -p <prompt>   one-shot prompt (default: interactive)\n"
         "  -t <n>        threads (default 8)\n"
         "  -c <n>        ring context size (default 65536)\n"
-        "  --temp <f>    temperature (default 0.7)\n"
-        "  --repeat <f>  repeat penalty (default 1.05)\n"
+        "  --temp <f>    temperature (default 1.0)\n"
+        "  --repeat <f>  repeat penalty (default 1.1)\n"
         "  --eos-penalty <f>  control-token logit penalty (default 5.0)\n"
         "  --no-think    disable the <think> block\n"
+        "  --check-align print whether the model is 4K-aligned (no repack, no load)\n"
         "  --ecache <mb> bounded expert cache (default 1024; 0 = mmap)\n"
         "  --session <dir>  persistent continual session\n"
         "  --workdir <dir>  working directory for tools (default: cwd)\n"
@@ -967,6 +986,7 @@ int main(int argc, char **argv) {
             snprintf(g_workdir, sizeof(g_workdir), "%s", argv[++i]);
         }
         else if (strcmp(argv[i], "--reset") == 0) g_reset = 1;
+        else if (strcmp(argv[i], "--check-align") == 0) g_check_align = 1;
         else if (strcmp(argv[i], "--no-color") == 0) g_use_color = 0;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
@@ -1001,12 +1021,27 @@ int main(int argc, char **argv) {
     if (getenv("QMA_NOTHERMAL") == NULL)
         thermal_start();
 
+    if (g_check_align) {
+        char err[512] = "";
+        int need = qma_model_needs_align(g_model_path, err, sizeof(err));
+        if (need < 0) {
+            fprintf(stderr, "qma: check-align: %s\n", err);
+            return 2;
+        }
+        fprintf(stderr, "qma: model %s is %s\n", g_model_path,
+                need ? "NOT 4K-aligned (repack on next normal launch)"
+                     : "4K-aligned (O_DIRECT ready)");
+        return 0;
+    }
+
     fprintf(stderr, "qma: loading %s ...\n", g_model_path);
     char err[512];
     if (qma_load(&g_model, g_model_path, err, sizeof(err)) != 0) {
         fprintf(stderr, "qma: load failed: %s\n", err);
         return 1;
     }
+    fprintf(stderr, "qma: expert reads: %s\n",
+            g_model.dio_fd >= 0 ? "O_DIRECT (4K-aligned, no page cache)" : "buffered (page cache)");
     qma_prefetch_init(&g_model);
     /* YALIS: accumulate per-expert output averages to predict the next
        layer's input for prefetching. The machinery existed but was never

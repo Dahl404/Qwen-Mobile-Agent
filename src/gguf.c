@@ -9,8 +9,11 @@
 #include "qma.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+#include <time.h>
 
 
 uint64_t qma_hash64(const void *data, size_t len) {
@@ -101,6 +104,7 @@ static void tok_hash_insert(qma_t *m, const char *str, size_t len, uint32_t id) 
 int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
+    m->dio_fd = -1;
 
     m->fd = open(path, O_RDONLY);
     if (m->fd < 0) { snprintf(err, errlen, "cannot open %s", path); return -1; }
@@ -500,6 +504,30 @@ int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
         if (rm.err) { snprintf(err, errlen, "corrupt merges list"); return -1; }
     }
 
+    /* O_DIRECT expert reads: if every expert tensor is 4K-aligned AND the
+       per-expert record strides are 4K-multiples, open a second fd with
+       O_DIRECT so expert preads bypass the page cache entirely — no
+       double-buffering with the ecache pool, and expert pages never churn
+       the trunk's page cache. Falls back to buffered preads otherwise
+       (unaligned file or filesystem without O_DIRECT). The file is made
+       4K-aligned by qma_align_model() at startup. */
+    {
+        const size_t slab = (size_t)N_EMBD * N_FF_EXP;
+        const size_t gu = slab * sizeof(block_q4_K) / QK_K;
+        int ok = 1;
+        for (int il = 0; il < N_LAYER && ok; il++) {
+            const size_t dn = slab * (m->layers[il].t_down_exps == GGML_TYPE_Q4_K
+                                          ? sizeof(block_q4_K) : sizeof(block_q6_K)) / QK_K;
+            if (m->layers[il].off_gate_exps % 4096 || m->layers[il].off_up_exps % 4096 ||
+                m->layers[il].off_down_exps % 4096 || gu % 4096 || dn % 4096)
+                ok = 0;
+        }
+        if (ok) {
+            int dfd = open(path, O_RDONLY | O_DIRECT);
+            if (dfd >= 0) m->dio_fd = dfd;
+        }
+    }
+
     return 0;
 }
 
@@ -508,6 +536,7 @@ void qma_free(qma_t *m) {
         munmap(m->map, m->map_size);
         close(m->fd);
     }
+    if (m->dio_fd >= 0) close(m->dio_fd);
     for (int i = 0; i < N_VOCAB && i < m->n_vocab; i++) free(m->tok_text[i]);
     free(m->tensors);
     free(m->tok_keys);
@@ -515,4 +544,390 @@ void qma_free(qma_t *m) {
     free(m->mg_keys);
     free(m->mg_rank);
     memset(m, 0, sizeof(*m));
+}
+
+/* ---------------- one-time model alignment (4K tensor starts) ----------------
+ * O_DIRECT expert reads require every tensor's file offset to be 4K-aligned.
+ * GGUF writers use alignment=32, so tensor starts drift out of 4K. This
+ * repacks the file once (streaming, same data, +a few MB of padding) so every
+ * tensor starts on a 4096 boundary and sets general.alignment=4096. The result
+ * is written to <src>.4k next to the original; the caller then loads THAT file
+ * and O_DIRECT expert reads become possible. Disable the automatic repack at
+ * startup with QMA_NOALIGN=1. */
+
+typedef struct {
+    size_t   alignment;
+    off_t    align_pos;    /* file offset of general.alignment VALUE, -1 if absent */
+    int      align_width;  /* 4 or 8 */
+    size_t   meta_end;     /* just past the last metadata KV */
+    size_t   infos_end;    /* just past the last tensor info */
+    uint32_t n_tensors;
+    size_t  *off;          /* relative tensor offsets (from data section start) */
+    size_t  *nbytes;
+    off_t   *off_pos;      /* file offset of each offset field in the info table */
+} gguf_scan_t;
+
+static void gguf_scan_free(gguf_scan_t *s) {
+    free(s->off); free(s->nbytes); free(s->off_pos);
+    memset(s, 0, sizeof(*s));
+}
+
+/* header-only scan: magic/version, metadata (skipped except general.alignment),
+   and the tensor info table. Mirrors qma_load's layout math exactly. */
+static int gguf_scan(const char *path, gguf_scan_t *s, char *err, size_t errlen) {
+    memset(s, 0, sizeof(*s));
+    s->align_pos = -1;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { snprintf(err, errlen, "cannot open %s", path); return -1; }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < 16) {
+        close(fd); snprintf(err, errlen, "bad file %s", path); return -1;
+    }
+    size_t msize = (size_t)st.st_size;
+    uint8_t *map = mmap(NULL, msize, PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) { close(fd); snprintf(err, errlen, "mmap %s", path); return -1; }
+    int rc = -1;
+    reader_t r = { map, map + msize, 0 };
+    if (memcmp(r.p, "GGUF", 4) != 0) { snprintf(err, errlen, "%s not a GGUF", path); goto out; }
+    r.p += 4;
+    rd_u32(&r); /* version */
+    uint64_t n_tensors = rd_u64(&r), n_kv = rd_u64(&r);
+    size_t alignment = 32;
+    for (uint64_t i = 0; i < n_kv && !r.err; i++) {
+        size_t klen; const uint8_t *key = rd_str(&r, &klen);
+        uint32_t t = rd_u32(&r);
+        if (r.err) break;
+        if (klen == 17 && memcmp(key, "general.alignment", 17) == 0) {
+            s->align_pos = (off_t)(r.p - map);
+            if (t == 4)      { s->align_width = 4; alignment = (size_t)rd_u32(&r); }
+            else if (t == 10 || t == 11) { s->align_width = 8; alignment = (size_t)rd_u64(&r); }
+            else             { s->align_pos = -1; rd_skip_val(&r, t); }
+        } else {
+            rd_skip_val(&r, t);
+        }
+    }
+    if (r.err) { snprintf(err, errlen, "%s: corrupt metadata", path); goto out; }
+    s->meta_end = (size_t)(r.p - map);
+    /* NOTE: this engine (and this file) place the tensor info table
+       IMMEDIATELY after the last metadata KV — no alignment padding before
+       it (the padding applies to the data section only). Match that. */
+    if (n_tensors > (1u << 20)) { snprintf(err, errlen, "%s: absurd tensor count", path); goto out; }
+    s->n_tensors = (uint32_t)n_tensors;
+    s->off      = malloc(sizeof(size_t) * s->n_tensors);
+    s->nbytes   = malloc(sizeof(size_t) * s->n_tensors);
+    s->off_pos  = malloc(sizeof(off_t) * s->n_tensors);
+    if (!s->off || !s->nbytes || !s->off_pos) { snprintf(err, errlen, "oom"); goto out; }
+    for (uint32_t i = 0; i < s->n_tensors && !r.err; i++) {
+        size_t nlen; rd_str(&r, &nlen);          /* name: skip */
+        uint32_t nd = rd_u32(&r);
+        int64_t dims[3] = { 1, 1, 1 };
+        for (uint32_t d = 0; d < nd && d < 3 && !r.err; d++) dims[d] = (int64_t)rd_u64(&r);
+        for (uint32_t d = 3; d < nd && !r.err; d++) rd_u64(&r);
+        uint32_t typ = rd_u32(&r);
+        if (r.err) break;
+        s->off_pos[i] = (off_t)(r.p - map);
+        s->off[i] = (size_t)rd_u64(&r);
+        if (r.err) break;
+        size_t bs, blk;
+        switch (typ) {
+        case GGML_TYPE_F32:  bs = 4;              blk = 1;   break;
+        case GGML_TYPE_Q4_K: bs = sizeof(block_q4_K); blk = QK_K; break;
+        case GGML_TYPE_Q6_K: bs = sizeof(block_q6_K); blk = QK_K; break;
+        default:
+            snprintf(err, errlen, "%s: tensor %u unsupported type %u", path, i, typ);
+            goto out;
+        }
+        if (dims[0] % blk != 0) { snprintf(err, errlen, "%s: tensor %u ne0 not block multiple", path, i); goto out; }
+        s->nbytes[i] = (size_t)((dims[0] / blk) * dims[1]) * bs * (size_t)dims[2];
+    }
+    if (r.err) { snprintf(err, errlen, "%s: corrupt tensor info", path); goto out; }
+    s->infos_end = (size_t)(r.p - map);
+    s->alignment = alignment;
+    rc = 0;
+out:
+    munmap(map, msize);
+    close(fd);
+    if (rc != 0) gguf_scan_free(s);
+    return rc;
+}
+
+/* 1 = every tensor start is 4K-aligned (O_DIRECT-able), 0 = needs repack */
+static int gguf_all_aligned(const gguf_scan_t *s, size_t *data_start_out) {
+    const size_t ds = (s->infos_end + s->alignment - 1) / s->alignment * s->alignment;
+    int ok = 1;
+    for (uint32_t i = 0; i < s->n_tensors && ok; i++)
+        if ((ds + s->off[i]) % 4096 != 0) ok = 0;
+    if (data_start_out) *data_start_out = ds;   /* ALWAYS: caller needs it */
+    return ok;
+}
+
+static double align_now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+/* 1 = model needs the 4K repack, 0 = already aligned, -1 = error */
+int qma_model_needs_align(const char *path, char *err, size_t errlen) {
+    gguf_scan_t s;
+    if (gguf_scan(path, &s, err, errlen) != 0) return -1;
+    int need = !gguf_all_aligned(&s, NULL);
+    gguf_scan_free(&s);
+    return need;
+}
+
+static int write_all(int fd, const void *buf, size_t n) {
+    const uint8_t *p = buf;
+    while (n > 0) {
+        ssize_t w = write(fd, p, n);
+        if (w <= 0) return -1;
+        p += w; n -= (size_t)w;
+    }
+    return 0;
+}
+
+/* Ensure `src` is O_DIRECT-able: repack to <src>.4k if tensor starts aren't
+   4K-aligned. On success *use_path holds the file to load (== src when already
+   aligned). Failure to repack (no space, corrupt file) falls back to src with
+   a warning on stderr — never a hard error. */
+int qma_align_model(const char *src, char *use_path, size_t use_len, char *err, size_t errlen) {
+    const double t0 = align_now_s();
+    gguf_scan_t s;
+    char ebuf[256];
+    if (gguf_scan(src, &s, ebuf, sizeof(ebuf)) != 0) {
+        snprintf(err, errlen, "%s", ebuf);
+        return -1;
+    }
+    size_t old_ds;
+    if (gguf_all_aligned(&s, &old_ds)) {
+        snprintf(use_path, use_len, "%s", src);
+        gguf_scan_free(&s);
+        return 0;
+    }
+    const size_t infos_start_old = s.meta_end;   /* infos follow metadata directly */
+
+    char cand[4096];
+    snprintf(cand, sizeof(cand), "%s.4k", src);
+    /* reuse a previously aligned copy if it's valid */
+    {
+        gguf_scan_t c;
+        if (gguf_scan(cand, &c, ebuf, sizeof(ebuf)) == 0) {
+            if (gguf_all_aligned(&c, NULL)) {
+                struct stat cst;
+                double gb = 0;
+                if (stat(cand, &cst) == 0) gb = (double)cst.st_size / 1e9;
+                fprintf(stderr, "qma: aligned model found: %s (%.2f GiB, %.1fs)\n",
+                        cand, gb, align_now_s() - t0);
+                snprintf(use_path, use_len, "%s", cand);
+                gguf_scan_free(&c);
+                gguf_scan_free(&s);
+                return 0;
+            }
+            gguf_scan_free(&c);
+        }
+        unlink(cand);
+    }
+
+    /* free space check (need file + a 64MB buffer headroom) */
+    struct stat st;
+    if (stat(src, &st) != 0) { gguf_scan_free(&s); snprintf(err, errlen, "stat %s", src); return -1; }
+    const uint64_t need = (uint64_t)st.st_size + (1ull << 26);
+    const uint64_t total = (uint64_t)st.st_size;
+    uint64_t freeb = 0;
+    {
+        char dir[4096]; size_t n = strlen(src);
+        while (n > 0 && src[n-1] != '/') n--;
+        if (n == 0) snprintf(dir, sizeof(dir), ".");
+        else        snprintf(dir, sizeof(dir), "%.*s", (int)(n - 1), src);
+        struct statvfs vfs;
+        if (statvfs(dir, &vfs) == 0) freeb = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+        if (freeb && freeb < need) {
+            fprintf(stderr, "qma: not enough free space for aligned model "
+                    "(need %.1f GiB, have %.1f GiB) — using %s\n",
+                    (double)need / 1e9, (double)freeb / 1e9, src);
+            snprintf(use_path, use_len, "%s", src);
+            gguf_scan_free(&s);
+            return 0;
+        }
+    }
+
+    /* detailed boot log: what we're doing and why */
+    fprintf(stderr, "qma: model %s is NOT 4K-aligned — repacking (one-time)\n", src);
+    fprintf(stderr, "qma:   file %.2f GiB · %u tensors · alignment %zu · free %.1f GiB\n",
+            (double)total / 1e9, s.n_tensors, s.alignment,
+            freeb ? (double)freeb / 1e9 : 0.0);
+    fprintf(stderr, "qma:   writing %s\n", cand);
+
+    char tmp[4100];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", cand);
+    unlink(tmp);
+    int out = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (out < 0) {
+        snprintf(err, errlen, "cannot create %s: %s", tmp, strerror(errno));
+        gguf_scan_free(&s);
+        return -1;
+    }
+    int in = open(src, O_RDONLY);
+    if (in < 0) { close(out); unlink(tmp); snprintf(err, errlen, "cannot open %s", src); gguf_scan_free(&s); return -1; }
+
+    uint8_t *buf = malloc(1u << 26);
+    if (!buf) { close(in); close(out); unlink(tmp); snprintf(err, errlen, "oom"); gguf_scan_free(&s); return -1; }
+    int rc = -1;
+
+    /* 1) [0, meta_end) verbatim */
+    {
+        size_t left = s.meta_end, off = 0;
+        while (left > 0) {
+            size_t c = left < (1u << 26) ? left : (1u << 26);
+            if (pread(in, buf, c, (off_t)off) != (ssize_t)c) goto fail;
+            if (write_all(out, buf, c) != 0) goto fail;
+            off += c; left -= c;
+        }
+    }
+    /* 2) general.alignment missing? append the KV (type UINT32) + bump n_kv */
+    if (s.align_pos < 0) {
+        uint8_t kv[8 + 17 + 4 + 4];
+        size_t o = 0;
+        uint64_t kl = 17;   /* "general.alignment" is 17 chars — a 16-byte copy
+                               truncates to "general.alignmen", which qma_load's
+                               strcmp misses and silently keeps alignment=32 */
+        memcpy(kv + o, &kl, 8); o += 8;
+        memcpy(kv + o, "general.alignment", 17); o += 17;
+        uint32_t t = 4, v = 4096;
+        memcpy(kv + o, &t, 4); o += 4;
+        memcpy(kv + o, &v, 4); o += 4;
+        if (write_all(out, kv, o) != 0) goto fail;
+        /* n_kv lives at file offset 16 (magic 4 + version 4 + n_tensors 8) */
+        uint64_t nk = 0;
+        if (pread(in, &nk, 8, 16) != 8) goto fail;
+        nk += 1;
+        if (pwrite(out, &nk, 8, 16) != 8) goto fail;
+    }
+    /* 3) copy the info table verbatim — IMMEDIATELY after metadata, matching
+       the engine's reader (no padding before infos) */
+    off_t new_infos_start = 0;
+    {
+        new_infos_start = lseek(out, 0, SEEK_CUR);
+        size_t left = s.infos_end - infos_start_old, off = infos_start_old;
+        while (left > 0) {
+            size_t c = left < (1u << 26) ? left : (1u << 26);
+            if (pread(in, buf, c, (off_t)off) != (ssize_t)c) goto fail;
+            if (write_all(out, buf, c) != 0) goto fail;
+            off += c; left -= c;
+        }
+    }
+    /* 4) tensor data: pad every tensor start to 4096, copy bytes, patch offsets */
+    uint64_t pad_written = 0;
+    {
+        off_t pos = lseek(out, 0, SEEK_CUR);
+        size_t pad = (size_t)((4096 - ((size_t)pos % 4096)) % 4096);
+        if (pad) { memset(buf, 0, pad); if (write_all(out, buf, pad) != 0) goto fail; pad_written += pad; }
+        const off_t new_ds = lseek(out, 0, SEEK_CUR);
+        uint64_t copied = 0, last_report = 0;
+        for (uint32_t i = 0; i < s.n_tensors; i++) {
+            off_t cur = lseek(out, 0, SEEK_CUR);
+            size_t p2 = (size_t)((4096 - ((size_t)cur % 4096)) % 4096);
+            if (p2) { memset(buf, 0, p2); if (write_all(out, buf, p2) != 0) goto fail; pad_written += p2; }
+            off_t tstart = lseek(out, 0, SEEK_CUR);
+            size_t left = s.nbytes[i], off = old_ds + s.off[i];
+            while (left > 0) {
+                size_t c = left < (1u << 26) ? left : (1u << 26);
+                if (pread(in, buf, c, (off_t)off) != (ssize_t)c) goto fail;
+                if (write_all(out, buf, c) != 0) goto fail;
+                off += c; left -= c;
+            }
+            uint64_t nrel = (uint64_t)(tstart - new_ds);
+            off_t fpos = new_infos_start + (s.off_pos[i] - (off_t)infos_start_old);
+            if (pwrite(out, &nrel, 8, fpos) != 8) goto fail;
+            copied += s.nbytes[i];
+            if (copied - last_report >= (2ull << 30) || i + 1 == s.n_tensors) {
+                const double dt = align_now_s() - t0;
+                fprintf(stderr, "qma:   align %5.1f%%  %5.1f/%5.1f GiB  (%4.0f MiB/s)\n",
+                        (double)copied / (double)total * 100.0,
+                        (double)copied / 1e9, (double)total / 1e9,
+                        dt > 0.1 ? (double)copied / 1048576.0 / dt : 0.0);
+                last_report = copied;
+            }
+        }
+    }
+    /* 5) patch general.alignment to 4096 */
+    if (s.align_pos >= 0) {
+        if (s.align_width == 4) {
+            uint32_t v = 4096;
+            if (pwrite(out, &v, 4, s.align_pos) != 4) goto fail;
+        } else {
+            uint64_t v = 4096;
+            if (pwrite(out, &v, 8, s.align_pos) != 8) goto fail;
+        }
+    }
+    if (fsync(out) != 0) goto fail;
+    close(out);
+    if (rename(tmp, cand) != 0) {
+        close(in);
+        snprintf(err, errlen, "rename: %s", strerror(errno));
+        free(buf); gguf_scan_free(&s);
+        return -1;
+    }
+    /* 6) verify the result: alignment + tensor-byte spot-check
+       (source fd `in` is still open — closing it earlier made the check
+       read from a closed fd and falsely reject every repack) */
+    {
+        gguf_scan_t v;
+        if (gguf_scan(cand, &v, ebuf, sizeof(ebuf)) != 0 || !gguf_all_aligned(&v, NULL)) {
+            snprintf(err, errlen, "aligned model failed verification — keeping %s", src);
+            unlink(cand);
+            gguf_scan_free(&v);
+            close(in);
+            free(buf); gguf_scan_free(&s);
+            return -1;
+        }
+        /* compare the head of tensor 0 and the last tensor, byte-for-byte,
+           between source and repacked file (catches wrong-source copies) */
+        int bad = 0;
+        int vfd = open(cand, O_RDONLY);
+        if (vfd < 0) { bad = 1; }
+        else {
+            const size_t vds = (v.infos_end + v.alignment - 1) / v.alignment * v.alignment;
+            const uint32_t picks[2] = { 0, s.n_tensors - 1 };
+            for (int k = 0; k < 2 && !bad; k++) {
+                const uint32_t i = picks[k];
+                const size_t nb = s.nbytes[i];
+                const size_t chk = nb < (1u << 20) ? nb : (1u << 20);
+                if (nb == 0) continue;
+                if (pread(in, buf, chk, (off_t)(old_ds + s.off[i])) != (ssize_t)chk) { bad = 1; break; }
+                uint8_t *b2 = malloc(chk);
+                if (!b2) { bad = 1; break; }
+                if (pread(vfd, b2, chk, (off_t)(vds + v.off[i])) != (ssize_t)chk) { free(b2); bad = 1; break; }
+                if (memcmp(buf, b2, chk) != 0) { free(b2); bad = 1; break; }
+                free(b2);
+            }
+            close(vfd);
+        }
+        if (bad) {
+            snprintf(err, errlen, "aligned model data mismatch — keeping %s", src);
+            unlink(cand);
+            gguf_scan_free(&v);
+            close(in);
+            free(buf); gguf_scan_free(&s);
+            return -1;
+        }
+        gguf_scan_free(&v);
+    }
+    close(in);
+    snprintf(use_path, use_len, "%s", cand);
+    {
+        const double dt = align_now_s() - t0;
+        fprintf(stderr, "qma: model aligned: %s\n", cand);
+        fprintf(stderr, "qma:   %.2f GiB written in %.1fs (%.0f MiB/s) · +%.1f MB padding\n",
+                (double)total / 1e9, dt,
+                dt > 0.1 ? (double)total / 1048576.0 / dt : 0.0,
+                (double)pad_written / 1e6);
+        fprintf(stderr, "qma:   next launches will load %s and use O_DIRECT expert reads\n", cand);
+    }
+    rc = 0;
+fail:
+    if (rc != 0) { close(out); close(in); unlink(tmp); }
+    free(buf);
+    gguf_scan_free(&s);
+    return rc;
 }

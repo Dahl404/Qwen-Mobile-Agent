@@ -1570,12 +1570,27 @@ static int expert_fetch(void *user, int layer, int expert, uint8_t *dst)
     const size_t gu = slab * sizeof(block_q4_K) / QK_K;
     const size_t dn = slab * (m->layers[layer].t_down_exps == GGML_TYPE_Q4_K
                                   ? sizeof(block_q4_K) : sizeof(block_q6_K)) / QK_K;
-    if (pread_all(m->fd, dst, gu, m->layers[layer].off_gate_exps + (size_t)expert * gu) != 0)
+    /* O_DIRECT path: expert bytes land straight in the pool — no page-cache
+       copy at all. Only when the fd exists AND the destination is 4K-aligned
+       (O_DIRECT requires an aligned buffer; pool slots are 16K-aligned). */
+    const int use_dio = (m->dio_fd >= 0) && (((uintptr_t)dst & 4095u) == 0);
+    const int fd = use_dio ? m->dio_fd : m->fd;
+    if (pread_all(fd, dst, gu, m->layers[layer].off_gate_exps + (size_t)expert * gu) != 0)
         return -1;
-    if (pread_all(m->fd, dst + gu, gu, m->layers[layer].off_up_exps + (size_t)expert * gu) != 0)
+    if (pread_all(fd, dst + gu, gu, m->layers[layer].off_up_exps + (size_t)expert * gu) != 0)
         return -1;
-    if (pread_all(m->fd, dst + 2 * gu, dn, m->layers[layer].off_down_exps + (size_t)expert * dn) != 0)
+    if (pread_all(fd, dst + 2 * gu, dn, m->layers[layer].off_down_exps + (size_t)expert * dn) != 0)
         return -1;
+    /* Buffered preads just populated the page cache with expert pages. The
+       ecache pool now owns these bytes and experts are NEVER read via the
+       mmap in this mode (trunk only), so drop the file-side copies: no
+       double-buffer, no cache churn evicting trunk pages. No-op if the
+       pages aren't resident; skipped entirely on the O_DIRECT path. */
+    if (!use_dio && m->map) {
+        madvise(m->map + m->layers[layer].off_gate_exps + (size_t)expert * gu, gu, MADV_DONTNEED);
+        madvise(m->map + m->layers[layer].off_up_exps   + (size_t)expert * gu, gu, MADV_DONTNEED);
+        madvise(m->map + m->layers[layer].off_down_exps + (size_t)expert * dn, dn, MADV_DONTNEED);
+    }
     return 0;
 }
 
