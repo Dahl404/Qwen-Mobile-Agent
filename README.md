@@ -176,3 +176,8 @@ src/
 session snapshotting, and tool-call grammar — each linking only the source
 files it needs, without loading a model.
 
+
+##DISCLAIMER:
+This is a pre-alpha build so it might have some bugs, it does work, gets 
+around 3tps steady, and is minimal on battery usage, but past that no guarentees. 
+
