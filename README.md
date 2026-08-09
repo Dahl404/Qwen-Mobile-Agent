@@ -114,7 +114,7 @@ qma -p "prompt"            one-shot, non-interactive
 
 | Flag | Meaning |
 |---|---|
-| `-m <path>` | path to the `.gguf` model file |
+| `-m <path>` | path to the `.gguf` model file (else `~/.qma/config`, else it prompts) |
 | `-p <prompt>` | run one prompt and exit, instead of an interactive session |
 | `-t <n>` | number of threads (default 8) |
 | `-c <n>` | ring context size in tokens (default 65536) |
@@ -130,6 +130,16 @@ qma -p "prompt"            one-shot, non-interactive
 | `-h` / `--help` | show usage |
 
 Interactive commands: `/exit`, `/quit`, `/reset`, `/clear`.
+
+### Model path & ESC
+
+- The model path is remembered in `~/.qma/config` (written on every launch).
+  Resolution order: `-m` flag → config embedded in a snapshot binary →
+  `~/.qma/config` → interactive prompt. If the chosen file doesn't exist,
+  qma reprompts for a path; in non-interactive mode it errors out.
+- Press `ESC` during generation to cancel the current turn and return to the
+  `you>` prompt (the partial reply stays in the context, closed off cleanly).
+  `Ctrl-C` still shuts the program down.
 
 
 ## Environment variables

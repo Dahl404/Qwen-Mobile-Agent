@@ -1,0 +1,12 @@
+# qma — build outputs
+/qma
+
+# selfctx snapshot binaries carry embedded session history — never commit
+/qma-*
+
+# scratch / test worktree (extracted sessions live here)
+/work/
+
+# compiler artifacts
+*.o
+*.a

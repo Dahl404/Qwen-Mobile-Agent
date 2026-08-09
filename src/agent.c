@@ -23,6 +23,9 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <termios.h>
+#include <poll.h>
+#include <pthread.h>
 #include "qma.h"
 #include "json.h"
 #include "toolparse.h"
@@ -53,6 +56,8 @@ static char g_self_exe[1024] = ""; /* running binary path (readlink /proc/self/e
 static char g_session_dir[1024] = "";
 static char g_workdir[4096] = "";
 static const char *g_model_path = NULL;
+static char g_cfg_path[1024] = "";       /* ~/.qma/config — model path memory */
+static char g_model_path_buf[4096] = ""; /* resolved model path (stable storage) */
 
 /* ---- engine state ---- */
 static qma_t g_model;
@@ -60,6 +65,8 @@ static runstate_t g_rs;
 static int g_rs_ready = 0;
 static volatile sig_atomic_t g_shutdown = 0;
 static volatile sig_atomic_t g_stop_turn = 0;
+static volatile sig_atomic_t g_snoop_reset = 0;   /* /reset typed mid-generation */
+static int g_stdin_tty = 0;   /* ESC snoop only on a real terminal */
 
 #define MAX_TURNS  50   /* pi-style turn budget: the only runaway guard */
 
@@ -81,6 +88,82 @@ static void out(const char *s) {
     fflush(stdout);
 }
 
+/* ---- ESC snoop: cancel generation and return to the user turn ----
+ * While the model is generating, stdin is switched to a raw-ish mode
+ * (ICANON|ECHO off, ISIG kept so Ctrl-C still delivers SIGINT) and a
+ * background thread polls it. A bare ESC sets g_stop_turn; the generation
+ * loop breaks, agent_generate closes the assistant frame, and agent_turn
+ * returns to the prompt. Any other keypress is dropped silently. The
+ * terminal is restored before tools execute, so ask_user()'s fgets is
+ * unaffected. */
+static struct termios g_save_tio;
+static int g_tio_saved = 0;
+static pthread_t g_snoop;
+static volatile int g_snoop_on = 0;
+
+static void *snoop_thread(void *arg) {
+    (void)arg;
+    struct pollfd pfd = { .fd = 0, .events = POLLIN };
+    char line[64];
+    int nline = 0;
+    while (g_snoop_on) {
+        if (poll(&pfd, 1, 50) <= 0) continue;
+        unsigned char c;
+        ssize_t n = read(0, &c, 1);
+        if (n != 1) continue;
+        if (c == 0x1b) { g_stop_turn = 1; break; }   /* ESC: cancel the turn */
+        if (c == '\n' || c == '\r') {
+            /* a full line typed during generation: honor the slash commands
+               so typing /exit isn't silently eaten by the raw-mode snoop */
+            if (nline >= 1 && line[0] == '/') {
+                line[nline] = 0;
+                if (strcmp(line, "/exit") == 0 || strcmp(line, "/quit") == 0) {
+                    g_shutdown = 1;
+                    g_stop_turn = 1;
+                    break;
+                }
+                if (strcmp(line, "/reset") == 0 || strcmp(line, "/clear") == 0) {
+                    g_snoop_reset = 1;
+                    g_stop_turn = 1;
+                    break;
+                }
+            }
+            nline = 0;
+        } else if (nline < (int)sizeof(line) - 1) {
+            line[nline++] = (char)c;
+        }
+    }
+    return NULL;
+}
+
+static void key_snoop_start(void) {
+    if (!g_stdin_tty || g_snoop_on) return;
+    struct termios t;
+    if (tcgetattr(0, &t) != 0) return;
+    g_save_tio = t;
+    g_tio_saved = 1;
+    t.c_lflag &= ~(ICANON | ECHO);   /* raw-ish; ISIG stays on */
+    t.c_cc[VMIN] = 0;
+    t.c_cc[VTIME] = 0;
+    tcsetattr(0, TCSANOW, &t);
+    g_snoop_on = 1;
+    if (pthread_create(&g_snoop, NULL, snoop_thread, NULL) != 0) {
+        g_snoop_on = 0;
+        tcsetattr(0, TCSANOW, &g_save_tio);
+        g_tio_saved = 0;
+    }
+}
+
+static void key_snoop_stop(void) {
+    if (!g_snoop_on) return;
+    g_snoop_on = 0;
+    pthread_join(g_snoop, NULL);
+    if (g_tio_saved) {
+        tcsetattr(0, TCSANOW, &g_save_tio);
+        g_tio_saved = 0;
+    }
+}
+
 /* UTF-8 piece buffering (byte BPE can split a char across tokens) */
 static char g_piece[64];
 static int g_piece_len = 0;
@@ -90,24 +173,15 @@ static void flush_piece(void) {
     g_piece_len = 0;
 }
 static void print_piece(const char *s) {
+    /* Never drop bytes: the old code skipped the copy when a piece would
+       overflow the 60-byte budget, silently losing words ("Either way" →
+       "Ei") and mangling tags ("</tool_call>" → "</tool>"). Flush the
+       buffer first whenever it is full, then copy byte-by-byte. */
     size_t len = strlen(s);
-    int hold = 0;
-    while (hold < 3 && len - hold > 0) {
-        unsigned char c = (unsigned char)s[len - 1 - hold];
-        if (c < 0x80) break;
-        if ((c & 0xC0) == 0xC0) { hold++; break; }
-        hold++;
+    for (size_t i = 0; i < len; i++) {
+        if (g_piece_len >= 56) flush_piece();
+        g_piece[g_piece_len++] = s[i];
     }
-    size_t take = len - (size_t)hold;
-    if (g_piece_len + (int)take < 60) {
-        memcpy(g_piece + g_piece_len, s, take);
-        g_piece_len += (int)take;
-    }
-    if (hold > 0 && g_piece_len + hold < 64) {
-        memcpy(g_piece + g_piece_len, s + take, (size_t)hold);
-        g_piece_len += hold;
-    }
-    if (g_piece_len >= 56) flush_piece();
 }
 
 /* ---- session (continual KV) ---- */
@@ -145,9 +219,11 @@ static void finish_session(void) {
     } else {
         snprintf(out_dir, sizeof(out_dir), ".");
     }
-    char *out = selfctx_snapshot(g_self_exe, g_session_dir, out_dir);
+    char *out = selfctx_snapshot(g_self_exe, g_session_dir, out_dir,
+                                 g_model_path, strlen(g_model_path) + 1);
     if (!out && strcmp(out_dir, ".") != 0)
-        out = selfctx_snapshot(g_self_exe, g_session_dir, ".");
+        out = selfctx_snapshot(g_self_exe, g_session_dir, ".",
+                               g_model_path, strlen(g_model_path) + 1);
     if (out) {
         fprintf(stderr, "qma: context snapshot → %s\n", out);
         free(out);
@@ -196,6 +272,117 @@ static void mkdirs(const char *path) {
         }
     }
     mkdir(tmp, 0700);
+}
+
+/* ---- model-path config (~/.qma/config) ----
+ * The model path lives in a small config file so the binary is portable:
+ * copy a snapshot to another phone and it knows what to load (and
+ * reprompts if that path is missing there). The choice is also embedded in
+ * the snapshot binary itself (see selfctx) and rewritten here on launch. */
+static void cfg_path(char *buf, size_t n) {
+    const char *home = getenv("HOME");
+    if (home && home[0]) snprintf(buf, n, "%s/.qma/config", home);
+    else snprintf(buf, n, ".qma/config");
+}
+
+/* read the first model path from the config (comments/#, "key = value"
+   or a bare path line) */
+static int cfg_read_model(char *out, size_t n) {
+    FILE *f = fopen(g_cfg_path, "r");
+    if (!f) return 0;
+    int got = 0;
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\n' || *p == '\r' || *p == 0) continue;
+        char *eq = strchr(p, '=');
+        if (eq) {
+            p = eq + 1;
+            while (*p == ' ' || *p == '\t') p++;
+        }
+        size_t l = strlen(p);
+        while (l > 0 && (p[l-1] == '\n' || p[l-1] == '\r' ||
+                         p[l-1] == ' ' || p[l-1] == '\t')) p[--l] = 0;
+        if (l > 0) { snprintf(out, n, "%s", p); got = 1; break; }
+    }
+    fclose(f);
+    return got;
+}
+
+static void cfg_write_model(const char *path) {
+    char d[4096];
+    snprintf(d, sizeof(d), "%s", g_cfg_path);
+    char *sl = strrchr(d, '/');
+    if (sl) { *sl = 0; mkdirs(d); }
+    FILE *f = fopen(g_cfg_path, "w");
+    if (!f) return;
+    fprintf(f, "# qma config — model path (GGUF). Rewritten by qma on launch.\n"
+              "model = %s\n", path);
+    fclose(f);
+}
+
+static int path_is_model(const char *p) {
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* Resolve the model path. Sources, in order: CLI -m, embedded snapshot
+   config, config file, interactive prompt. Validate existence and
+   reprompt on failure (non-interactive: error out). Persist the choice. */
+static void resolve_model_path(int from_cli) {
+    char cand[4096] = "";
+    int have = 0;
+
+    if (from_cli) {
+        snprintf(cand, sizeof(cand), "%s", g_model_path);
+        have = 1;
+    } else {
+        /* embedded in this (snapshot) binary? */
+        selfctx_hdr_t hdr;
+        if (g_self_exe[0] && selfctx_detect(g_self_exe, &hdr)) {
+            char *cfg = selfctx_get_config(g_self_exe, &hdr);
+            if (cfg && cfg[0]) { snprintf(cand, sizeof(cand), "%s", cfg); have = 1; }
+            free(cfg);
+        }
+        if (!have) have = cfg_read_model(cand, sizeof(cand));
+        if (!have && !g_stdin_tty) {
+            fprintf(stderr, "qma: no model path configured — using default %s\n",
+                    DEFAULT_MODEL);
+            snprintf(cand, sizeof(cand), "%s", DEFAULT_MODEL);
+            have = 1;
+        }
+    }
+
+    int eof = 0;
+    for (;;) {
+        if (!have) {
+            c_cyan();
+            printf("model path (GGUF file, empty = default) > ");
+            c_reset();
+            fflush(stdout);
+            if (!fgets(cand, sizeof(cand), stdin)) {
+                snprintf(cand, sizeof(cand), "%s", DEFAULT_MODEL);
+                eof = 1;
+            } else {
+                size_t l = strlen(cand);
+                while (l > 0 && (cand[l-1] == '\n' || cand[l-1] == '\r')) cand[--l] = 0;
+                if (l == 0) snprintf(cand, sizeof(cand), "%s", DEFAULT_MODEL);
+            }
+            have = 1;
+        }
+        if (path_is_model(cand)) break;
+        if (!g_stdin_tty || eof) {
+            fprintf(stderr, "qma: model not found: %s\n", cand);
+            exit(1);
+        }
+        fprintf(stderr, "qma: model not found: %s — try again\n", cand);
+        have = 0;
+    }
+
+    snprintf(g_model_path_buf, sizeof(g_model_path_buf), "%s", cand);
+    g_model_path = g_model_path_buf;
+    cfg_write_model(g_model_path);
 }
 
 static void session_init(void) {
@@ -306,6 +493,7 @@ typedef struct {
     tool_call_t calls[MAX_TOOL_CALLS];
     int n_calls;
     int had_tool_mode;      /* model attempted a call (even if dropped) */
+    int cancelled;          /* generation stopped by the user (ESC) */
 } gen_result_t;
 
 static void apply_eos_penalty(const qma_t *m, float *logits) {
@@ -336,6 +524,7 @@ static void print_content(gen_result_t *res, const char *s, size_t n) {
 static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                           gen_result_t *res) {
     memset(res, 0, sizeof(*res));
+    g_stop_turn = 0;   /* fresh turn: clear any earlier soft stop (ESC) */
     double t_pre0 = now_s2();
     int *ids = malloc(sizeof(int) * 262144);
     if (!ids) return -1;
@@ -363,8 +552,9 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
 
     int cap = 262144;
     c_dim();
+    int cancelled = 0;
     for (int i = 0; i < cap; i++) {
-        if (g_stop_turn) break;
+        if (g_stop_turn) { cancelled = 1; break; }
         /* two-phase sampling with grammar constraint (llama.cpp approach):
            get the top-k candidates, mask any that cannot legally extend the
            tool-call grammar, then sample. This makes malformed calls
@@ -420,11 +610,11 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                         buf[tlen - 8] = 0;
                     char *op = strstr(buf, "<think>");
                     if (op) {
+                        flush_piece();   /* older thinking bytes first */
                         fputs(op + 7, stdout);
-                        flush_piece();
                     } else {
-                        fputs(buf, stdout);
                         flush_piece();
+                        fputs(buf, stdout);
                     }
                 }
                 reasoning_emitted = pos;
@@ -464,6 +654,7 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                                  sizeof(res->calls[res->n_calls].args), "%s", tc.args);
                         res->n_calls++;
                         c_reset(); c_cyan();
+                        flush_piece();   /* pending raw tokens before the ⬡ line */
                         printf("\n⬡ %s(%s)\n", tc.name, tc.args);
                         c_reset(); c_dim();
                     }
@@ -487,6 +678,12 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                 memmove(ans, stray + 8, rest);
                 ans_len = rest;
                 ans[ans_len] = 0;
+                /* the first draft was already streamed: mark the rewind so
+                   the duplication is explained, not read as engine output */
+                flush_piece();
+                c_dim();
+                fputs("\n[draft rewound — the model re-drafted its answer]\n", stdout);
+                c_reset();
             }
             char *tc = strstr(ans, "<tool_call>");
             if (tc) {
@@ -525,6 +722,18 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
     c_reset();
     flush_piece();
 
+    if (cancelled) {
+        /* ESC: stop here. The partial assistant text is already in the KV;
+           eval <|im_end|> to close the frame so the next user turn starts
+           from a clean boundary. Partial tool results are discarded — the
+           turn ends and control returns to the user prompt. */
+        int ie = (int)m->id_im_end;
+        if (ie > 0) qma_eval(m, &g_rs, &ie, 1, logits, g_threads, g_prefetch, 0);
+        res->cancelled = 1;
+        free(raw); free(ans); free(ids); free(logits);
+        return 0;
+    }
+
     /* finalize: flush any complete blocks, then remaining content */
     if (tool_mode) {
         for (;;) {
@@ -541,6 +750,7 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                     snprintf(res->calls[res->n_calls].args, sizeof(res->calls[res->n_calls].args), "%s", tc.args);
                     res->n_calls++;
                     c_cyan();
+                    flush_piece();   /* pending raw tokens before the ⬡ line */
                     printf("\n⬡ %s(%s)\n", tc.name, tc.args);
                     c_reset();
                 }
@@ -614,12 +824,21 @@ static int agent_turn(const char *input) {
         } else {
             build_user_delta(delta, sizeof(delta), cur);
         }
-        if (agent_generate(&g_model, delta, g_enable_thinking, &res) != 0) {
+        key_snoop_start();
+        int gr = agent_generate(&g_model, delta, g_enable_thinking, &res);
+        key_snoop_stop();
+        if (gr != 0) {
             c_red(); printf("\n[generation failed]\n"); c_reset();
             free(cur);
             return -1;
         }
         printf("\n");
+
+        if (res.cancelled) {
+            c_yellow(); printf("[cancelled — back to you]\n"); c_reset();
+            free(cur);
+            return 0;
+        }
 
         if (res.n_calls > 0) {
             /* execute every call, fold results back, call the model again */
@@ -696,7 +915,7 @@ static void build_system_prompt(char *buf, size_t buflen) {
 static void usage(const char *prog) {
     fprintf(stderr,
         "usage: %s [options]\n"
-        "  -m <path>     model file (default: %s)\n"
+        "  -m <path>     model file (default: %s, else ~/.qma/config)\n"
         "  -p <prompt>   one-shot prompt (default: interactive)\n"
         "  -t <n>        threads (default 8)\n"
         "  -c <n>        ring context size (default 65536)\n"
@@ -716,10 +935,15 @@ static void usage(const char *prog) {
 
 int main(int argc, char **argv) {
     const char *one_shot = NULL;
+    int model_from_cli = 0;
     g_model_path = DEFAULT_MODEL;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) g_model_path = argv[++i];
+        if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            snprintf(g_model_path_buf, sizeof(g_model_path_buf), "%s", argv[++i]);
+            g_model_path = g_model_path_buf;
+            model_from_cli = 1;
+        }
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) one_shot = argv[++i];
         else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) g_threads = atoi(argv[++i]);
         else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) g_ctx = atoi(argv[++i]);
@@ -741,6 +965,7 @@ int main(int argc, char **argv) {
     }
 
     g_use_color = isatty(1) && isatty(0);  /* ANSI only on a real terminal */
+    g_stdin_tty = isatty(0);               /* ESC snoop + prompt only on a tty */
     if (g_workdir[0]) {
         /* create the workdir if missing */
         char tmp[4096];
@@ -752,6 +977,17 @@ int main(int argc, char **argv) {
         if (chdir(g_workdir) != 0)
             fprintf(stderr, "qma: workdir %s: %s\n", g_workdir, strerror(errno));
     }
+
+    /* resolve the running binary (read-only self-read is allowed; writing
+       to it is not — "Text file busy" — so snapshots are NEW files) */
+    {
+        ssize_t n = readlink("/proc/self/exe", g_self_exe, sizeof(g_self_exe) - 1);
+        if (n > 0) g_self_exe[n] = 0;
+        else snprintf(g_self_exe, sizeof(g_self_exe), "%s", argv[0]);
+    }
+    /* model path: CLI -m > embedded snapshot config > ~/.qma/config > prompt */
+    cfg_path(g_cfg_path, sizeof(g_cfg_path));
+    resolve_model_path(model_from_cli);
 
     /* silent thermal governor (off for debugging via QMA_NOTHERMAL=1) */
     if (getenv("QMA_NOTHERMAL") == NULL)
@@ -782,13 +1018,6 @@ int main(int argc, char **argv) {
     }
 
     build_system_prompt(g_system_prompt, sizeof(g_system_prompt));
-    /* resolve the running binary (read-only self-read is allowed; writing
-       to it is not — "Text file busy" — so snapshots are NEW files) */
-    {
-        ssize_t n = readlink("/proc/self/exe", g_self_exe, sizeof(g_self_exe) - 1);
-        if (n > 0) g_self_exe[n] = 0;
-        else snprintf(g_self_exe, sizeof(g_self_exe), "%s", argv[0]);
-    }
     /* session mode: --session <dir> = classic persistent dir (no
        snapshots); default = temp dir + dated context snapshot on exit */
     if (!g_session_dir[0]) {
@@ -872,6 +1101,14 @@ int main(int argc, char **argv) {
             continue;
         }
         agent_turn(line);
+        if (g_snoop_reset) {
+            g_snoop_reset = 0;
+            session_reset();
+            fprintf(stderr, "qma: context wiped — ingesting system prompt…\n");
+            ingest_system_prompt();
+            fprintf(stderr, "session reset (n_pos=%d)\n", g_rs.n_pos);
+            continue;
+        }
     }
     thermal_stop();
     finish_session();

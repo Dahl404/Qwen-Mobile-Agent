@@ -76,7 +76,8 @@ int selfctx_detect(const char *path, selfctx_hdr_t *hdr) {
     if (memcmp(h.magic, SELFCTX_MAGIC, 8) != 0) return 0;
     /* sanity: offsets must look sane */
     if (h.base_size == 0 || h.base_size > (uint64_t)st.st_size) return 0;
-    if (h.kv_off < h.base_size) return 0;
+    if (h.cfg_off < h.base_size) return 0;
+    if (h.cfg_off + h.cfg_size > h.kv_off) return 0;
     if (h.kv_off + h.kv_size > (uint64_t)st.st_size) return 0;
     if (hdr) *hdr = h;
     return 1;
@@ -127,6 +128,19 @@ out1:
     return rc;
 }
 
+char *selfctx_get_config(const char *path, const selfctx_hdr_t *hdr) {
+    if (!hdr || hdr->cfg_size == 0) return NULL;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    char *buf = malloc((size_t)hdr->cfg_size + 1);
+    if (!buf) { close(fd); return NULL; }
+    ssize_t n = pread(fd, buf, (size_t)hdr->cfg_size, (off_t)hdr->cfg_off);
+    close(fd);
+    if (n != (ssize_t)hdr->cfg_size) { free(buf); return NULL; }
+    buf[hdr->cfg_size] = 0;
+    return buf;
+}
+
 /* 1 if s is a valid YYYYMMDD-HHMM timestamp (13 chars: 8 digits, '-', 4 digits) */
 static int is_ts_suffix(const char *s) {
     if (strlen(s) != 13) return 0;
@@ -137,7 +151,8 @@ static int is_ts_suffix(const char *s) {
     return 1;
 }
 
-char *selfctx_snapshot(const char *src, const char *dir, const char *out_dir) {
+char *selfctx_snapshot(const char *src, const char *dir, const char *out_dir,
+                       const char *cfg, size_t cfg_len) {
     selfctx_hdr_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     memcpy(hdr.magic, SELFCTX_MAGIC, 8);
@@ -168,8 +183,10 @@ char *selfctx_snapshot(const char *src, const char *dir, const char *out_dir) {
     int have_st = (stat(st_path, &sst) == 0);
     int have_sal = (stat(sal_path, &ast) == 0);
 
-    /* layout: [base][pad][kv][state][salience][header] */
-    hdr.kv_off = align_up(hdr.base_size, PAGE);
+    /* layout: [base][pad][cfg][kv][state][salience][header] */
+    hdr.cfg_off = align_up(hdr.base_size, PAGE);
+    hdr.cfg_size = cfg ? (uint64_t)cfg_len : 0;
+    hdr.kv_off = hdr.cfg_off + hdr.cfg_size;
     hdr.kv_size = (uint64_t)kst.st_size;
     hdr.st_off = hdr.kv_off + hdr.kv_size;
     hdr.st_size = have_st ? (uint64_t)sst.st_size : 0;
@@ -209,6 +226,11 @@ char *selfctx_snapshot(const char *src, const char *dir, const char *out_dir) {
     if (ftruncate(dst, (off_t)total) != 0) goto fail;
     /* base code */
     if (copy_plain_at(src_fd, 0, dst, 0, (size_t)hdr.base_size) != 0) goto fail;
+    /* model-path config blob */
+    if (hdr.cfg_size > 0) {
+        if (pwrite(dst, cfg, (size_t)hdr.cfg_size, (off_t)hdr.cfg_off) != (ssize_t)hdr.cfg_size)
+            goto fail;
+    }
     /* KV (sparse) */
     {
         int kv = open(kv_path, O_RDONLY);
