@@ -978,8 +978,7 @@ static void hcm_init(int n_ctx) {
    in the hot loop (slots precomputed here). RING: positions are absolute;
    the KV is a static ring, so every position we keep must be >= n_pos -
    ring_cap (older slots were recycled). */
-static void hcm_rebuild(runstate_t *rs) {
-    const int n_pos = rs->n_pos;
+static void hcm_rebuild(runstate_t *rs, int n_pos) {
     const int ring = hcm_ctx_cap - HCM_SINK;   /* recyclable slots */
     const int oldest = n_pos - ring;           /* first still-alive position */
     const int kvq = (kvq_on == 1);
@@ -2083,12 +2082,19 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
         if (g_timing) { timing_init(); }
 
         /* hierarchical context memory: init once per runstate, rebuild the
-           live index every HCM_REBUILD tokens (amortized re-rank). */
+           live index every HCM_REBUILD tokens (amortized re-rank). The
+           trigger uses the RUNNING position (rs->n_pos + done), not the
+           pre-call value — rs->n_pos is frozen until this eval returns, so
+           a multi-thousand-token prefill used to never re-fire mid-call and
+           the dense "since last rebuild" tail grew to the whole prefill
+           (O(n^2) attention). Rebuilds now re-fire at chunk boundaries, so
+           that tail stays bounded by MAX_CHUNK. */
         if (hcm_on < 0) hcm_init(rs->n_ctx);
-        if (hcm_on && rs->n_pos >= hcm_next_rebuild) {
-            hcm_rebuild(rs);
-            hcm_rebuilt_at = rs->n_pos;
-            hcm_next_rebuild = rs->n_pos + HCM_REBUILD;
+        const int pos_now = rs->n_pos + done;
+        if (hcm_on && pos_now >= hcm_next_rebuild) {
+            hcm_rebuild(rs, pos_now);
+            hcm_rebuilt_at = pos_now;
+            hcm_next_rebuild = pos_now + HCM_REBUILD;
         }
 
         for (int il = 0; il < N_LAYER; il++) {

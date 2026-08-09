@@ -848,11 +848,19 @@ static int agent_turn(const char *input) {
                 char *r = NULL;
                 tool_dispatch(res.calls[i].name, res.calls[i].args, &r);
                 if (strlen(r) > 6000) {
-                    char *tmp = malloc(6004);
-                    memcpy(tmp, r, 6000);
-                    strcpy(tmp + 6000, "...\n[output truncated]");
-                    free(r);
-                    r = tmp;
+                    /* heap overflow fix: the "...\n[output truncated]" suffix
+                       is 26 bytes incl. NUL; the old code allocated 6004 and
+                       wrote 6026 — any output over 6000 chars overran the
+                       heap. Size to the actual suffix length instead. */
+                    static const char trunc[] = "...\n[output truncated]";
+                    size_t need = 6000 + sizeof(trunc);
+                    char *tmp = malloc(need);
+                    if (tmp) {
+                        memcpy(tmp, r, 6000);
+                        memcpy(tmp + 6000, trunc, sizeof(trunc)); /* incl. NUL */
+                        free(r);
+                        r = tmp;
+                    }
                 }
                 results[n_res++] = r;
                 if (strncmp(r, "ERROR:", 6) == 0) {
