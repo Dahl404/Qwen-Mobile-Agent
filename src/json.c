@@ -19,20 +19,73 @@ static jval_t *jparse_string(const char **pp) {
     const char *p = *pp;
     if (*p != '"') return NULL;
     p++;
-    const char *start = p;
+    /* unescape into an owned buffer (the previous implementation copied
+       the raw bytes and left \n \t \" \\ as literal text, so every
+       multi-line tool value was written corrupted) */
+    size_t cap = 64, len = 0;
+    char *copy = malloc(cap);
+    if (!copy) return NULL;
+    int bad = 0;
     while (*p && *p != '"') {
-        if (*p == '\\') p++;
-        p++;
+        if (len + 8 >= cap) {
+            size_t ncap = cap * 2;
+            char *n = realloc(copy, ncap);
+            if (!n) { bad = 1; break; }
+            copy = n;
+            cap = ncap;
+        }
+        unsigned char c = (unsigned char)*p;
+        if (c == '\\') {
+            p++;
+            if (!*p) { bad = 1; break; }
+            switch (*p) {
+            case 'n':  copy[len++] = '\n'; p++; break;
+            case 'r':  copy[len++] = '\r'; p++; break;
+            case 't':  copy[len++] = '\t'; p++; break;
+            case 'b':  copy[len++] = '\b'; p++; break;
+            case 'f':  copy[len++] = '\f'; p++; break;
+            case '"':  copy[len++] = '"'; p++; break;
+            case '\\': copy[len++] = '\\'; p++; break;
+            case '/':  copy[len++] = '/'; p++; break;
+            case 'u': {
+                uint32_t u = 0;
+                int ok = 1;
+                for (int i = 0; i < 4; i++) {
+                    p++;
+                    unsigned char h = (unsigned char)*p;
+                    uint32_t v;
+                    if (h >= '0' && h <= '9') v = (uint32_t)(h - '0');
+                    else if (h >= 'a' && h <= 'f') v = (uint32_t)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') v = (uint32_t)(h - 'A' + 10);
+                    else { ok = 0; break; }
+                    u = (u << 4) | v;
+                }
+                if (!ok) { bad = 1; break; }
+                p++;   /* past the 4th hex digit */
+                if (u < 0x80) copy[len++] = (char)u;
+                else if (u < 0x800) {
+                    copy[len++] = (char)(0xC0 | (u >> 6));
+                    copy[len++] = (char)(0x80 | (u & 0x3F));
+                } else {
+                    copy[len++] = (char)(0xE0 | (u >> 12));
+                    copy[len++] = (char)(0x80 | ((u >> 6) & 0x3F));
+                    copy[len++] = (char)(0x80 | (u & 0x3F));
+                }
+                break;
+            }
+            default: bad = 1; break;   /* unknown escape: refuse */
+            }
+        } else {
+            copy[len++] = (char)c;
+            p++;
+        }
     }
-    if (*p != '"') return NULL;
+    if (bad || *p != '"') { free(copy); return NULL; }
+    copy[len] = 0;
     jval_t *v = calloc(1, sizeof(jval_t));
-    if (!v) return NULL;
+    if (!v) { free(copy); return NULL; }
     v->type = J_STR;
-    v->slen = (size_t)(p - start);
-    char *copy = malloc(v->slen + 1);
-    if (!copy) { free(v); return NULL; }
-    memcpy(copy, start, v->slen);
-    copy[v->slen] = 0;
+    v->slen = len;
     v->s = copy;
     *pp = p + 1;
     return v;
