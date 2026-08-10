@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include "tools.h"
 #include "json.h"
+#include "intern.h"
 
 /* ---------------- schemas ---------------- */
 
@@ -88,6 +89,9 @@ const tool_schema_t g_tools[] = {
     {"battery",
      "Report phone battery status (level, charging state, health, temperature) as JSON.",
      "{\"type\":\"object\",\"properties\":{}}"},
+    {"self_build",
+     "Compile the internal source tree (/internal/src) with the same flags as the Makefile and smoke-test the result. Call after editing your own code to verify it before qma commits it at exit.",
+     "{\"type\":\"object\",\"properties\":{}}"},
 };
 
 const int g_n_tools = (int)(sizeof(g_tools) / sizeof(g_tools[0]));
@@ -139,6 +143,31 @@ static char *read_whole_file(const char *path) {
 
 /* ---------------- tool implementations ---------------- */
 
+
+/* ---- internal filesystem mapping ----
+   The agent's internal tree (its own source + collected tools/data) lives
+   at $QMA_INTERNAL, extracted from the binary at boot. Structured tools
+   accept the logical path /internal/... and we rewrite it to the real
+   location; bash uses the $QMA_INTERNAL env var instead. */
+static char g_intern_root[4096] = "";
+void intern_set_root(const char *root) {
+    snprintf(g_intern_root, sizeof(g_intern_root), "%s", root);
+}
+
+static char g_map_buf[4096];
+/* rewrite "/internal/..." / "internal/..." to <root>/...; otherwise as-is */
+static const char *map_path(const char *p) {
+    const char *rest = NULL;
+    if (!g_intern_root[0] || !p) return p;
+    if (strncmp(p, "/internal/", 10) == 0)    rest = p + 10;
+    else if (strcmp(p, "/internal") == 0)     rest = "";
+    else if (strncmp(p, "internal/", 9) == 0) rest = p + 9;
+    else if (strcmp(p, "internal") == 0)      rest = "";
+    if (!rest) return p;
+    snprintf(g_map_buf, sizeof(g_map_buf), "%s/%s", g_intern_root, rest);
+    return g_map_buf;
+}
+
 static char *t_pwd(void) {
     char buf[4096];
     if (!getcwd(buf, sizeof(buf))) return fmt("ERROR: getcwd: %s", strerror(errno));
@@ -146,7 +175,7 @@ static char *t_pwd(void) {
 }
 
 static char *t_list_dir(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     if (!path[0]) path = ".";
     int hidden = json_bool(json_obj_get(args, "show_hidden"));
     int lng = json_bool(json_obj_get(args, "long_format"));
@@ -184,7 +213,7 @@ static char *t_list_dir(const jval_t *args) {
 
 static char *t_search(const jval_t *args) {
     const char *pattern = json_str(json_obj_get(args, "pattern"));
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     int recursive = json_bool(json_obj_get(args, "recursive"));
     if (!pattern[0]) return fmt("ERROR: pattern is required");
     if (!path[0]) path = ".";
@@ -211,7 +240,7 @@ static char *t_search(const jval_t *args) {
 }
 
 static char *t_read_file(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     int start = (int)json_num(json_obj_get(args, "start_line"));
     int maxl = (int)json_num(json_obj_get(args, "max_lines"));
     char *err = path_guard(path);
@@ -241,7 +270,7 @@ static char *t_read_file(const jval_t *args) {
 }
 
 static char *t_write_file(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     const char *content = json_str(json_obj_get(args, "content"));
     char *err = path_guard(path);
     if (err) return err;
@@ -261,7 +290,7 @@ static char *t_write_file(const jval_t *args) {
 }
 
 static char *t_edit(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     char *err = path_guard(path);
     if (err) return err;
     const jval_t *edits = json_obj_get(args, "edits");
@@ -344,7 +373,7 @@ static char *lines_join(lines_t *ls) {
 }
 
 static char *t_replace_lines(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     int s = (int)json_num(json_obj_get(args, "start_line"));
     int e = (int)json_num(json_obj_get(args, "end_line"));
     const char *nc = json_str(json_obj_get(args, "new_content"));
@@ -386,7 +415,7 @@ static char *t_replace_lines(const jval_t *args) {
 }
 
 static char *t_insert_lines(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     int after = (int)json_num(json_obj_get(args, "after_line"));
     const char *content = json_str(json_obj_get(args, "content"));
     char *err = path_guard(path);
@@ -424,7 +453,7 @@ static char *t_insert_lines(const jval_t *args) {
 }
 
 static char *t_delete_lines(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     int s = (int)json_num(json_obj_get(args, "start_line"));
     int e = (int)json_num(json_obj_get(args, "end_line"));
     char *err = path_guard(path);
@@ -517,7 +546,7 @@ static char *t_execute_command(const jval_t *args) {
 }
 
 static char *t_enter(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     if (!path[0]) return xstrdup("ERROR: path is required");
     if (chdir(path) != 0) return fmt("ERROR: cannot enter '%s': %s", path, strerror(errno));
     char buf[4096];
@@ -658,7 +687,7 @@ static void find_walk(const char *base, const char *pattern, char *out, size_t *
 
 static char *t_find(const jval_t *args) {
     const char *pattern = json_str(json_obj_get(args, "pattern"));
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     if (!pattern[0]) return xstrdup("ERROR: pattern is required");
     if (!path[0]) path = ".";
     char *out = malloc(65536);
@@ -814,6 +843,39 @@ static char *t_battery(const jval_t *args) {
 /* ---------------- dispatch ---------------- */
 
 
+static char *t_self_build(const jval_t *args) {
+    (void)args;
+    if (!g_intern_root[0])
+        return xstrdup("ERROR: no internal tree mounted (this binary has no embedded source)");
+    char src_dir[1200], sess[1200], tmpbin[1200], cmd[8192], log[65536];
+    snprintf(src_dir, sizeof(src_dir), "%s/src", g_intern_root);
+    /* temp binary in the SESSION dir (never inside /internal, so it can't
+       get embedded at exit) */
+    snprintf(sess, sizeof(sess), "%s", g_intern_root);
+    size_t l = strlen(sess);
+    if (l > 9 && strcmp(sess + l - 9, "/internal") == 0) sess[l - 9] = 0;
+    snprintf(tmpbin, sizeof(tmpbin), "%s/selfbuild-%d", sess, (int)getpid());
+    intern_build_cmd(cmd, sizeof(cmd), src_dir, tmpbin);
+    int rc = sys_run_capture(cmd, 240, log, sizeof(log));
+    if (rc != 0) {
+        size_t ll = strlen(log);
+        const char *tail = ll > 3000 ? log + ll - 3000 : log;
+        unlink(tmpbin);
+        return fmt("ERROR: self_build failed (rc=%d):\n%s", rc, tail);
+    }
+    /* smoke-test the fresh binary */
+    char smoke[8192], s2[4096];
+    snprintf(smoke, sizeof(smoke), "%s --check-align 2>&1", tmpbin);
+    int src = sys_run_capture(smoke, 30, s2, sizeof(s2));
+    unlink(tmpbin);
+    if (src != 0) {
+        size_t ll = strlen(s2);
+        const char *tail = ll > 2000 ? s2 + ll - 2000 : s2;
+        return fmt("ERROR: self_build compiled but failed the smoke test:\n%s", tail);
+    }
+    return xstrdup("✓ self_build OK — /internal/src compiles and passes the smoke test");
+}
+
 int tool_dispatch(const char *name, const char *args_json, char **result) {
     jval_t *args = json_parse(args_json);
     if (!args) {
@@ -843,6 +905,7 @@ int tool_dispatch(const char *name, const char *args_json, char **result) {
     else if (strcmp(name, "notify") == 0) r = t_notify(args);
     else if (strcmp(name, "vibrate") == 0) r = t_vibrate(args);
     else if (strcmp(name, "battery") == 0) r = t_battery(args);
+    else if (strcmp(name, "self_build") == 0) r = t_self_build(args);
     else r = fmt("ERROR: unknown tool '%s'", name);
     json_free(args);
     if (!r) r = xstrdup("(no output)");

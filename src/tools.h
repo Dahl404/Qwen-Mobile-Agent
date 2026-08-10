@@ -19,6 +19,10 @@ extern const int g_n_tools;
 /* Render the <tools>...</tools> header (one tool JSON per line). */
 void tools_render_header(char *out, size_t outsz);
 
+/* Set the real path of the mounted internal tree (see map_path). Called by
+ * the agent at boot after extracting the embedded blob. */
+void intern_set_root(const char *root);
+
 /* Ask the user (blocking stdin read); returns the answer (heap). */
 char *tools_ask_user(const char *question);
 

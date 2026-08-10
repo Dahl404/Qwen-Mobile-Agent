@@ -18,8 +18,7 @@
 #include "qma.h"
 #include "grammar.h"
 
-/* ---- structural states ---- */
-enum {
+/* ---- structural states ---- */enum {
     ST_CALL_OPEN_TAG,      /* consuming "<tool_call>" */
     ST_CALL_OPEN_END,      /* ws, then '<' */
     ST_FUNCTION_LT,        /* saw '<': expect 'f' of "<function=" */
@@ -55,23 +54,6 @@ enum { NUM_START, NUM_INT, NUM_DOT, NUM_FRAC, NUM_EXP_MARK, NUM_EXP_SIGN, NUM_EX
 
 /* structure stack entries */
 enum { JE_VALUE_ARR, JE_VALUE_OBJ, JE_KEY, JE_COLON, JE_SEP_ARR, JE_SEP_OBJ };
-
-#define JSTK_CAP 16
-
-typedef struct {
-    int st;                /* structural state */
-    int tag_pos;           /* char index into the active tag */
-    /* value state */
-    int vj;                /* VJ_* */
-    int in_string, esc;    /* inside a JSON string */
-    int num_state;
-    const char *lit;       /* current literal ("true"/"false"/"null") */
-    int lit_pos;
-    int jstk[JSTK_CAP];    /* structure stack */
-    int jd;                /* depth */
-    int val_done;          /* top-level value completed */
-    int text_seen;         /* bare-text value has content */
-} gpos_t;
 
 static int ws_char(char c) { return c==' '||c=='\t'||c=='\n'||c=='\r'; }
 static int name_char(char c) {
@@ -370,11 +352,9 @@ static int grammar_replay(const char *text, size_t len, gpos_t *g) {
     return 1;
 }
 
-int grammar_tool_token_ok(qma_t *m, const char *ans, size_t ans_len, int id) {
-    if (id < 0 || id >= m->n_vocab || !m->tok_text[id]) return 0;
-    const char *piece = m->tok_text[id];
-    if (piece[0] == 0) return 0;      /* byte-0 special token */
-    /* find the OPEN call: the last "<tool_call>" with no "</tool_call>" after */
+/* find the open call in ans[0..ans_len): the LAST "<tool_call>" with no
+   "</tool_call>" after it. Returns a pointer to it or NULL. */
+static const char *grammar_open_call(const char *ans, size_t ans_len) {
     const char *e = ans + ans_len;
     const char *start = NULL, *p = ans;
     while ((p = strstr(p, "<tool_call>")) != NULL) {
@@ -382,11 +362,34 @@ int grammar_tool_token_ok(qma_t *m, const char *ans, size_t ans_len, int id) {
         if (!close || close >= e) { start = p; break; }
         p = close + strlen("</tool_call>");
     }
-    if (!start) return 1;   /* no open call: not constrained */
-    gpos_t g;
-    if (!grammar_replay(start, (size_t)(e - start), &g)) return 0;
+    return start;
+}
+
+int grammar_tool_open_state(qma_t *m, const char *ans, size_t ans_len,
+                            gpos_t *out) {
+    (void)m;
+    const char *start = grammar_open_call(ans, ans_len);
+    if (!start) return 0;   /* no open call: no constraint */
+    if (!grammar_replay(start, (size_t)(ans + ans_len - start), out))
+        return -1;          /* open call but its text is already invalid */
+    return 1;
+}
+
+int grammar_tool_token_from_state(const gpos_t *st, qma_t *m, int id) {
+    if (id < 0 || id >= m->n_vocab || !m->tok_text[id]) return 0;
+    const char *piece = m->tok_text[id];
+    if (piece[0] == 0) return 0;      /* byte-0 special token */
+    gpos_t g = *st;   /* copy: lit points at a read-only string literal */
     for (const char *q = piece; *q; q++) {
         if (!gchar(&g, *q)) return 0;
     }
     return 1;
+}
+
+int grammar_tool_token_ok(qma_t *m, const char *ans, size_t ans_len, int id) {
+    gpos_t g;
+    int st = grammar_tool_open_state(m, ans, ans_len, &g);
+    if (st == 0) return 1;              /* unconstrained */
+    if (st < 0) return 0;               /* open but invalid: reject */
+    return grammar_tool_token_from_state(&g, m, id);
 }

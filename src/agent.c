@@ -26,6 +26,8 @@
 #include <termios.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/ioctl.h>
+#include <dirent.h>
 #include "qma.h"
 #include "json.h"
 #include "toolparse.h"
@@ -33,6 +35,7 @@
 #include "grammar.h"
 #include "thermal.h"
 #include "selfctx.h"
+#include "intern.h"
 
 static const char *DEFAULT_MODEL = "/data/data/com.termux/files/home/projects/models/qwen3.6:35b:a3b-q4km.gguf";
 
@@ -72,6 +75,11 @@ static int g_stdin_tty = 0;   /* ESC snoop only on a real terminal */
 #define MAX_TURNS  50   /* pi-style turn budget: the only runaway guard */
 
 static char g_system_prompt[262144];   /* tools header + agent behavior */
+static char g_delta[524288];           /* turn delta AND tool-response delta — never live at once */
+
+/* ---- self-hosting: the embedded internal tree ---- */
+static char    g_intern_root[4096] = "";   /* <session>/internal (the /internal/ fs) */
+static uint64_t g_intern_gen = 0;           /* generation serial of the running binary */
 
 /* ---- terminal helpers ---- */
 static void color(const char *code) {
@@ -165,6 +173,210 @@ static void key_snoop_stop(void) {
     }
 }
 
+/* ---- line editor for the `you> ` prompt ----
+   Raw-mode input with arrow-key editing: Left/Right move the cursor
+   (utf8-aware), Up/Down walk the prompt history, Backspace/Delete edit at
+   the cursor, Home/End jump, Enter submits. Ctrl-C still works (ISIG stays
+   on). Only used on a real tty; non-tty input stays on plain fgets. The
+   terminal is restored before returning, so the generation-time ESC snoop
+   (key_snoop_start/stop) always sees canonical mode. */
+
+#define EDIT_HIST_MAX 16
+#define EDIT_HIST_LEN 4096
+static char  g_ehist[EDIT_HIST_MAX][EDIT_HIST_LEN];  /* prompts, newest last */
+static int   g_ehist_n = 0;
+static int   g_ehist_pos = -1;                       /* -1 = fresh line */
+static char  g_ehist_draft[65536];                   /* in-progress line */
+
+/* display columns of s[0..n): non-continuation bytes count 1 each */
+static size_t edit_cols(const char *s, size_t n) {
+    size_t c = 0;
+    for (size_t i = 0; i < n; i++)
+        if (((unsigned char)s[i] & 0xC0) != 0x80) c++;
+    return c;
+}
+
+/* byte position one utf8 char left / right of the cursor */
+static size_t edit_left(const char *s, size_t cur) {
+    if (cur == 0) return 0;
+    size_t i = cur - 1;
+    while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80) i--;
+    return i;
+}
+static size_t edit_right(const char *s, size_t len, size_t cur) {
+    if (cur >= len) return len;
+    size_t i = cur + 1;
+    while (i < len && ((unsigned char)s[i] & 0xC0) == 0x80) i++;
+    return i;
+}
+
+/* redraw the whole input line: back to the prompt's first row (wrapped
+   lines), \r + prompt + buffer, clear the tail, park the cursor at `cur`
+   (display columns, so utf8 keeps the cursor aligned) */
+static void edit_redraw(const char *buf, size_t len, size_t cur) {
+    struct winsize ws;
+    int cols = 80;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) cols = ws.ws_col;
+    const size_t total = 5 + edit_cols(buf, len);        /* "you> " = 5 cols */
+    const int rows = (int)((total + (size_t)cols - 1) / (size_t)cols);
+    if (rows > 1) printf("\x1b[%dA", rows - 1);        /* up to the prompt row */
+    printf("\r");
+    c_cyan(); printf("you> "); c_reset();
+    fputs(buf, stdout);
+    fputs("\x1b[K", stdout);                            /* clear row tail */
+    size_t back = edit_cols(buf, len) - edit_cols(buf, cur);
+    if (back > 0) printf("\x1b[%zuD", back);
+    fflush(stdout);
+}
+
+/* pull history entry into the buffer (newest last: index n-1) */
+static void edit_load_hist(char *buf, size_t cap, int idx) {
+    size_t n = strlen(g_ehist[idx]);
+    if (n >= cap) n = cap - 1;
+    memcpy(buf, g_ehist[idx], n);
+    buf[n] = 0;
+}
+
+/* record the submitted line in the history ring (dedup against the last) */
+static void edit_save_hist(const char *buf) {
+    if (buf[0] == 0) return;
+    if (g_ehist_n > 0 && strcmp(g_ehist[g_ehist_n - 1], buf) == 0) return;
+    if (g_ehist_n == EDIT_HIST_MAX) {
+        memmove(g_ehist[0], g_ehist[1], (size_t)(EDIT_HIST_MAX - 1) * EDIT_HIST_LEN);
+    } else {
+        g_ehist_n++;
+    }
+    snprintf(g_ehist[g_ehist_n - 1], EDIT_HIST_LEN, "%s", buf);
+}
+
+/* read one line with editing. Returns length (>= 0) or -1 on EOF/shutdown. */
+static int read_line_editor(char *buf, size_t cap) {
+    struct termios save, raw;
+    if (tcgetattr(0, &save) != 0) return -1;
+    raw = save;
+    raw.c_lflag &= ~(ICANON | ECHO);   /* raw-ish; ISIG stays on for Ctrl-C */
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(0, TCSANOW, &raw);
+
+    size_t len = 0, cur = 0;
+    buf[0] = 0;
+    edit_redraw(buf, 0, 0);
+    struct pollfd pfd = { .fd = 0, .events = POLLIN };
+    int rc = 0;
+    while (!rc) {
+        if (g_shutdown) { rc = -1; break; }
+        unsigned char c;
+        ssize_t n = read(0, &c, 1);
+        if (n != 1) continue;                      /* EINTR */
+        if (c == '\r' || c == '\n') { rc = (int)len; break; }
+        if (c == 0x1b) {
+            /* ESC [ x / ESC O x, or a bare ESC (ignored) */
+            if (poll(&pfd, 1, 30) > 0) {
+                unsigned char c2;
+                if (read(0, &c2, 1) == 1 && (c2 == '[' || c2 == 'O')) {
+                    if (poll(&pfd, 1, 30) > 0) {
+                        unsigned char c3;
+                        if (read(0, &c3, 1) == 1) {
+                            if (c2 == '[' && c3 >= '0' && c3 <= '9') {
+                                /* CSI n ~ : 1~/7~ home, 3~ delete, 4~/8~ end */
+                                if (poll(&pfd, 1, 30) > 0) {
+                                    unsigned char c4;
+                                    if (read(0, &c4, 1) == 1 && c4 == '~') {
+                                        if (c3 == '1' || c3 == '7') cur = 0;
+                                        else if (c3 == '4' || c3 == '8') cur = len;
+                                        else if (c3 == '3') {   /* delete */
+                                            size_t e = edit_right(buf, len, cur);
+                                            memmove(buf + cur, buf + e, len - e);
+                                            len -= e - cur;
+                                        }
+                                    }
+                                }
+                            } else if (c2 == '[') {
+                                switch (c3) {
+                                case 'A':   /* up: older */
+                                    if (g_ehist_n > 0) {
+                                        if (g_ehist_pos < 0) {
+                                            snprintf(g_ehist_draft, sizeof(g_ehist_draft), "%s", buf);
+                                            g_ehist_pos = g_ehist_n - 1;
+                                        } else if (g_ehist_pos > 0) {
+                                            g_ehist_pos--;
+                                        }
+                                        edit_load_hist(buf, cap, g_ehist_pos);
+                                        len = strlen(buf); cur = len;
+                                    }
+                                    break;
+                                case 'B':   /* down: newer */
+                                    if (g_ehist_pos >= 0) {
+                                        if (g_ehist_pos < g_ehist_n - 1) g_ehist_pos++;
+                                        else { g_ehist_pos = -1; len = strlen(g_ehist_draft);
+                                               if (len >= cap) len = cap - 1;
+                                               memcpy(buf, g_ehist_draft, len); buf[len] = 0; }
+                                        if (g_ehist_pos >= 0) {
+                                            edit_load_hist(buf, cap, g_ehist_pos);
+                                            len = strlen(buf);
+                                        }
+                                        cur = len;
+                                    }
+                                    break;
+                                case 'C':   /* right */
+                                    cur = edit_right(buf, len, cur);
+                                    break;
+                                case 'D':   /* left */
+                                    cur = edit_left(buf, cur);
+                                    break;
+                                case 'H':   /* home */
+                                    cur = 0;
+                                    break;
+                                case 'F':   /* end */
+                                    cur = len;
+                                    break;
+                                }
+                            } else if (c2 == 'O') {   /* SS3: H/F arrows */
+                                if (c3 == 'H') cur = 0;
+                                else if (c3 == 'F') cur = len;
+                                else if (c3 == 'C') cur = edit_right(buf, len, cur);
+                                else if (c3 == 'D') cur = edit_left(buf, cur);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (c == 0x7f || c == 0x08) {
+            /* backspace: delete the char before the cursor */
+            if (cur > 0) {
+                size_t s = edit_left(buf, cur);
+                memmove(buf + s, buf + cur, len - cur);
+                len -= cur - s;
+                cur = s;
+            }
+        } else if (c >= 0x20) {
+            /* printable (incl. utf8 continuation bytes) — insert at cursor */
+            if (len + 1 < cap) {
+                memmove(buf + cur + 1, buf + cur, len - cur);
+                buf[cur++] = (char)c;
+                len++;
+            }
+        }
+        buf[len] = 0;
+        edit_redraw(buf, len, cur);
+    }
+    tcsetattr(0, TCSANOW, &save);
+    if (rc > 0) { buf[len] = 0; edit_save_hist(buf); }
+    printf("\n");
+    fflush(stdout);
+    return rc;
+}
+
+/* input line: line editor on a tty, plain fgets otherwise */
+static int read_input_line(char *line, size_t cap) {
+    if (!g_stdin_tty) {
+        if (!fgets(line, cap, stdin)) return -1;
+        return (int)strlen(line);
+    }
+    return read_line_editor(line, cap);
+}
+
 /* UTF-8 piece buffering (byte BPE can split a char across tokens) */
 static char g_piece[64];
 static int g_piece_len = 0;
@@ -205,8 +417,85 @@ static void session_save(void) {
 
 static void session_wipe_files(void);   /* fwd (defined below) */
 
+/* ---- self-hosting: mount the embedded internal tree ---- */
+static void mkdirs(const char *path);   /* defined below (session helpers) */
+static void intern_init(void) {
+    g_intern_gen = 0;
+    g_intern_root[0] = 0;
+    selfctx_hdr_t h;
+    if (!g_self_exe[0] || !selfctx_detect(g_self_exe, &h) || h.int_size == 0) {
+        fprintf(stderr, "qma: no embedded internal tree (pre-self-hosting binary)\n");
+        return;
+    }
+    int fd = open(g_self_exe, O_RDONLY);
+    if (fd < 0) return;
+    char root[1200];
+    snprintf(root, sizeof(root), "%s/internal", g_session_dir);
+    mkdirs(root);
+    int rc = intern_extract_region(fd, (off_t)h.int_off, h.int_size, root);
+    close(fd);
+    if (rc != 0) { fprintf(stderr, "qma: internal tree extraction failed\n"); return; }
+    g_intern_gen = h.gen;
+    snprintf(g_intern_root, sizeof(g_intern_root), "%s", root);
+    intern_set_root(g_intern_root);          /* tools.c /internal/ mapping */
+    setenv("QMA_INTERNAL", g_intern_root, 1);
+    /* bootstrap the version log if this tree has none yet */
+    {
+        char v[1200];
+        snprintf(v, sizeof(v), "%s/VERSIONS.md", root);
+        struct stat st;
+        if (stat(v, &st) != 0) {
+            char ts[32];
+            time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
+            snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d",
+                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+            intern_log(root, "# qma generation log\n\n## gen %llu — %s — built\n",
+                       (unsigned long long)h.gen, ts);
+        }
+    }
+    uint32_t nf = 0; uint64_t nb = 0;
+    intern_stats(root, &nf, &nb);
+    fprintf(stderr, "qma: internal tree mounted at %s [gen %llu, %u files, %.1f KB]\n",
+            root, (unsigned long long)g_intern_gen, nf, (double)nb / 1024.0);
+}
+
+static void write_file_at(const char *dir, const char *name, const char *content) {
+    char p[4200];
+    snprintf(p, sizeof(p), "%s/%s", dir, name);
+    FILE *f = fopen(p, "w");
+    if (f) { fputs(content, f); fclose(f); }
+}
+
+/* delete older generation binaries (qma-gen<N>-...) in out_dir, keeping the
+   newest gen <= keep_gen. The bare base binary is never touched. */
+static void intern_retain(const char *out_dir, uint64_t keep_gen) {
+    DIR *d = opendir(out_dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "qma-gen", 7) != 0) continue;
+        const char *p = e->d_name + 7;
+        uint64_t g = 0;
+        while (*p >= '0' && *p <= '9') { g = g * 10 + (uint64_t)(*p - '0'); p++; }
+        if (p == e->d_name + 7 || *p != '-') continue;   /* not a gen name */
+        if (g < keep_gen) {
+            char fp[1200];
+            snprintf(fp, sizeof(fp), "%s/%s", out_dir, e->d_name);
+            unlink(fp);
+            fprintf(stderr, "qma: pruned old generation %s\n", e->d_name);
+        }
+    }
+    closedir(d);
+}
+
 /* snapshot the session into a dated copy of the binary, then remove the
-   temp session dir. Only in snapshot mode (no --session). */
+   temp session dir. Only in snapshot mode (no --session).
+   Self-hosting: on a clean exit qma recompiles itself from the (possibly
+   agent-edited) internal src, smoke-tests the fresh binary, and if it
+   passes, embeds the whole internal tree + context into the next
+   generation. On any failure it falls back to the current binary + the
+   edited internal tree + rebuild.log, so the agent can fix its own code
+   next boot. */
 static void finish_session(void) {
     session_save();
     if (!g_selfctx) return;
@@ -220,13 +509,70 @@ static void finish_session(void) {
     } else {
         snprintf(out_dir, sizeof(out_dir), ".");
     }
-    char *out = selfctx_snapshot(g_self_exe, g_session_dir, out_dir,
-                                 g_model_path, strlen(g_model_path) + 1);
-    if (!out && strcmp(out_dir, ".") != 0)
-        out = selfctx_snapshot(g_self_exe, g_session_dir, ".",
-                               g_model_path, strlen(g_model_path) + 1);
+
+    char *out = NULL;
+    const uint64_t gen = g_intern_gen;
+
+    if (g_intern_root[0]) {
+        /* ---- recompile from the edited internal source ---- */
+        char src_dir[1200], tmpbin[1200], cmd[8192], log[65536];
+        snprintf(src_dir, sizeof(src_dir), "%s/src", g_intern_root);
+        snprintf(tmpbin, sizeof(tmpbin), "%s/selfbuild", g_session_dir);
+        char ts[32];
+        {
+            time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
+            snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d",
+                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+        }
+        fprintf(stderr, "qma: rebuilding self from %s (gen %llu → %llu)…\n",
+                src_dir, (unsigned long long)gen, (unsigned long long)(gen + 1));
+        intern_build_cmd(cmd, sizeof(cmd), src_dir, tmpbin);
+        int rc = sys_run_capture(cmd, 240, log, sizeof(log));
+        if (rc == 0) {
+            /* smoke-test the fresh binary */
+            char smoke[8192], s2[4096];
+            snprintf(smoke, sizeof(smoke), "%s --check-align 2>&1", tmpbin);
+            int src = sys_run_capture(smoke, 30, s2, sizeof(s2));
+            if (src == 0) {
+                out = selfctx_snapshot_gen(tmpbin, g_session_dir, out_dir,
+                                           g_model_path, strlen(g_model_path) + 1,
+                                           g_intern_root, gen + 1);
+                if (out) {
+                    intern_log(g_intern_root,
+                        "## gen %llu — %s — build OK (smoke passed) — new binary %s\n",
+                        (unsigned long long)(gen + 1), ts, out);
+                    intern_retain(out_dir, gen + 1);
+                } else {
+                    intern_log(g_intern_root,
+                        "## gen %llu — %s — build OK but snapshot failed\n",
+                        (unsigned long long)(gen + 1), ts);
+                }
+            } else {
+                intern_log(g_intern_root,
+                    "## gen %llu — %s — build OK but SMOKE FAILED (see rebuild.log)\n",
+                    (unsigned long long)(gen + 1), ts);
+                write_file_at(g_intern_root, "rebuild.log", s2);
+                fprintf(stderr, "qma: self-build compiled but failed smoke test — keeping current binary\n");
+            }
+        } else {
+            intern_log(g_intern_root,
+                "## gen %llu — %s — build FAILED (see rebuild.log)\n",
+                (unsigned long long)(gen + 1), ts);
+            write_file_at(g_intern_root, "rebuild.log", log);
+            fprintf(stderr, "qma: self-build failed (rc=%d) — keeping current binary, errors → /internal/rebuild.log\n", rc);
+        }
+        unlink(tmpbin);
+    }
+
+    if (!out) {
+        /* fallback: current binary + (edited) internal tree + context, same gen */
+        out = selfctx_snapshot_gen(g_self_exe, g_session_dir, out_dir,
+                                   g_model_path, strlen(g_model_path) + 1,
+                                   g_intern_root[0] ? g_intern_root : NULL, gen);
+        if (out) intern_retain(out_dir, gen);
+    }
     if (out) {
-        fprintf(stderr, "qma: context snapshot → %s\n", out);
+        fprintf(stderr, "qma: generation → %s\n", out);
         free(out);
     } else {
         fprintf(stderr, "qma: snapshot failed (session kept in %s)\n", g_session_dir);
@@ -477,7 +823,7 @@ static void session_init(void) {
    and mark the ingestion complete so an interrupted warm-up is detected
    on the next launch */
 static void ingest_system_prompt(void) {
-    char sys_wrapped[270000];
+    static char sys_wrapped[270000];   /* one-time boot ingest; BSS, not stack */
     snprintf(sys_wrapped, sizeof(sys_wrapped),
              "<|im_start|>system\n%s<|im_end|>\n", g_system_prompt);
     int *ids = malloc(sizeof(int) * 262144);
@@ -566,6 +912,13 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
     int thinking_done = enable_thinking ? 0 : 1;
     int tool_mode = 0;
     size_t tool_scan = 0;
+    /* scan cursors: raw/ans grow by appending, but ans is also front-trimmed
+       (holdback emit, draft rewind, tool-call extraction). Each scan restarts
+       11 bytes before the cursor so a tag split across an append boundary is
+       still caught (all tags are <= 12 bytes; the overlap guarantees full
+       coverage of every position). */
+    size_t think_scan = 0;   /* "</think>" scan position in raw  */
+    size_t ans_scan = 0;     /* "</think>"/"<tool_call>" scan position in ans */
     int ngen = 0;
 
     int cap = 262144;
@@ -580,14 +933,22 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
         int cand_ids[40];
         float cand_lgs[40];
         int nc = sampler_candidates(N_VOCAB, logits, &sp, cand_ids, cand_lgs, 40);
-        if (nc > 0 && tool_mode && tool_block_open(ans, ans_len)) {
+        if (nc > 0 && tool_mode) {
+            /* build the grammar state ONCE per token, then test each
+               candidate against it — the old per-candidate replay was up to
+               40 full replays of the open call per token */
+            gpos_t gst;
+            const int gopen = grammar_tool_open_state(m, ans, ans_len, &gst);
             for (int ci = 0; ci < nc; ci++) {
                 if (cand_lgs[ci] <= -1e29f) continue;             /* already masked */
                 if (m->tok_type[cand_ids[ci]] & 4) {              /* control tokens */
                     cand_lgs[ci] = -1e30f;
                     continue;
                 }
-                if (!grammar_tool_token_ok(m, ans, ans_len, cand_ids[ci]))
+                /* gopen: 1 = constrain per candidate, -1 = open call already
+                   invalid (reject all), 0 = no open call (no constraint) */
+                if (gopen == -1 || (gopen == 1 &&
+                    !grammar_tool_token_from_state(&gst, m, cand_ids[ci])))
                     cand_lgs[ci] = -1e30f;                        /* grammar rejects */
             }
         }
@@ -613,8 +974,11 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
         }
 
         if (!thinking_done) {
-            /* reasoning phase */
-            char *close = strstr(raw, "</think>");
+            /* reasoning phase — scan only the bytes appended since the last
+               token (plus an 11-byte overlap for tags split across pieces) */
+            size_t ts = think_scan > 11 ? think_scan - 11 : 0;
+            char *close = strstr(raw + ts, "</think>");
+            think_scan = raw_len;
             if (close) {
                 size_t pos = (size_t)(close - raw) + strlen("</think>");
                 if (pos > reasoning_emitted) {
@@ -640,6 +1004,7 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                 ans_len = raw_len - pos;
                 if (ans_len > 0) memcpy(ans, raw + pos, ans_len);
                 ans[ans_len] = 0;
+                ans_scan = 0;   /* fresh ans buffer — rescan from the top */
                 c_reset();
             } else if (pl > 0) {
                 print_piece(piece);
@@ -689,21 +1054,26 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                 ans_len += (size_t)pl;
                 ans[ans_len] = 0;
             }
-            /* stray </think> rewind (Qwen3 drafts the answer twice) */
-            char *stray = strstr(ans, "</think>");
+            /* stray </think> rewind (Qwen3 drafts the answer twice) — cursor
+               scans only the new region (11-byte overlap for split tags) */
+            size_t as = ans_scan > 11 ? ans_scan - 11 : 0;
+            char *stray = strstr(ans + as, "</think>");
             if (stray) {
                 size_t rest = ans_len - (size_t)(stray - ans) - 8;
                 memmove(ans, stray + 8, rest);
                 ans_len = rest;
                 ans[ans_len] = 0;
+                ans_scan = 0;   /* front trimmed through the tag — rescan from top */
                 /* the first draft was already streamed: mark the rewind so
                    the duplication is explained, not read as engine output */
                 flush_piece();
                 c_dim();
                 fputs("\n[draft rewound — the model re-drafted its answer]\n", stdout);
                 c_reset();
+            } else {
+                ans_scan = ans_len;   /* no rewind: cursor = current end */
             }
-            char *tc = strstr(ans, "<tool_call>");
+            char *tc = strstr(ans + (stray ? 0 : as), "<tool_call>");
             if (tc) {
                 size_t pre = (size_t)(tc - ans);
                 if (pre > 0) {
@@ -714,6 +1084,7 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                 tool_mode = 1;
                 res->had_tool_mode = 1;   /* model attempted a call */
                 tool_scan = 0;
+                ans_scan = 0;   /* ans now starts at the call */
                 size_t rest = ans_len - pre;
                 memmove(ans, ans + pre, rest);
                 ans_len = rest;
@@ -731,6 +1102,7 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                 memmove(ans, ans + el, held);
                 ans_len = held;
                 ans[ans_len] = 0;
+                ans_scan = ans_len;   /* holdback trimmed el bytes from the front */
             }
         }
         if (qma_eval(m, &g_rs, &id, 1, logits, g_threads, g_prefetch, 0) != 0) break;
@@ -818,18 +1190,22 @@ static int build_tool_delta(char *buf, size_t buflen,
 
 /* ---- agent turn ---- */
 static int agent_turn(const char *input) {
-    char delta[524288];
     char *cur = strdup(input);
     int pre_rendered = 0;   /* cur is already a rendered template delta */
     int turns = 0;
-    gen_result_t res;
+    /* ~258KB struct (131KB content + 8 tool slots): keep it off the stack */
+    gen_result_t *res = calloc(1, sizeof(*res));
+    if (!res) { free(cur); return -1; }
 
     /* pi-agent loop: call the model, execute any tool calls, fold the
        results back and call again — the loop continues ONLY while the
        model calls tools. A text-only response ends the turn and control
        returns to the user prompt; the agent never nudges the model to
        keep going (no [continue], no DONE parsing). MAX_TURNS is the only
-       runaway guard, exactly like pi's turn budget. */
+       runaway guard, exactly like pi's turn budget. g_delta is shared
+       between the user delta and the tool-response delta — the two are
+       never live at the same time (the tool delta is strdup'd into cur
+       before the buffer is reused on the next iteration). */
     for (;;) {
         if (g_shutdown) break;
         if (++turns > MAX_TURNS) {
@@ -837,34 +1213,36 @@ static int agent_turn(const char *input) {
             break;
         }
         if (pre_rendered) {
-            snprintf(delta, sizeof(delta), "%s", cur);
+            snprintf(g_delta, sizeof(g_delta), "%s", cur);
             pre_rendered = 0;
         } else {
-            build_user_delta(delta, sizeof(delta), cur);
+            build_user_delta(g_delta, sizeof(g_delta), cur);
         }
         key_snoop_start();
-        int gr = agent_generate(&g_model, delta, g_enable_thinking, &res);
+        int gr = agent_generate(&g_model, g_delta, g_enable_thinking, res);
         key_snoop_stop();
         if (gr != 0) {
             c_red(); printf("\n[generation failed]\n"); c_reset();
             free(cur);
+            free(res);
             return -1;
         }
         printf("\n");
 
-        if (res.cancelled) {
+        if (res->cancelled) {
             c_yellow(); printf("[cancelled — back to you]\n"); c_reset();
             free(cur);
+            free(res);
             return 0;
         }
 
-        if (res.n_calls > 0) {
+        if (res->n_calls > 0) {
             /* execute every call, fold results back, call the model again */
             char *results[MAX_TOOL_CALLS];
             int n_res = 0;
-            for (int i = 0; i < res.n_calls; i++) {
+            for (int i = 0; i < res->n_calls; i++) {
                 char *r = NULL;
-                tool_dispatch(res.calls[i].name, res.calls[i].args, &r);
+                tool_dispatch(res->calls[i].name, res->calls[i].args, &r);
                 if (strlen(r) > 6000) {
                     /* heap overflow fix: the "...\n[output truncated]" suffix
                        is 26 bytes incl. NUL; the old code allocated 6004 and
@@ -887,26 +1265,24 @@ static int agent_turn(const char *input) {
                     c_green(); printf("  ✓ %s\n", r); c_reset();
                 }
             }
-            char td[524288];
-            build_tool_delta(td, sizeof(td), (const char **)results, n_res, NULL);
+            build_tool_delta(g_delta, sizeof(g_delta), (const char **)results, n_res, NULL);
             for (int i = 0; i < n_res; i++) free(results[i]);
             free(cur);
-            cur = strdup(td);
+            cur = strdup(g_delta);
             pre_rendered = 1;
             continue;
         }
 
-        if (res.had_tool_mode && res.n_calls == 0) {
+        if (res->had_tool_mode && res->n_calls == 0) {
             /* the model's calls were all malformed and the engine dropped
                them — feed that back as a tool error (exactly what pi does
                for a failed tool) and continue; bounded by MAX_TURNS */
-            char td[524288];
-            build_tool_delta(td, sizeof(td), NULL, 0,
+            build_tool_delta(g_delta, sizeof(g_delta), NULL, 0,
                 "ERROR: your tool call was malformed and discarded — it "
                 "NEVER executed. Re-issue it as ONE complete call with "
                 "valid arguments.");
             free(cur);
-            cur = strdup(td);
+            cur = strdup(g_delta);
             pre_rendered = 1;
             continue;
         }
@@ -915,26 +1291,42 @@ static int agent_turn(const char *input) {
         break;
     }
     free(cur);
+    free(res);
     return 0;
 }
 
 /* ---- system prompt ---- */
 static void build_system_prompt(char *buf, size_t buflen) {
-    char header[70000];
-    tools_render_header(header, sizeof(header));
-    snprintf(buf, buflen, "%s\n\n## Agent Behavior\n\n"
-        "You are an autonomous coding agent working on a phone. The user gives you a "
-        "goal; YOU drive the work to completion.\n"
-        "- Work step by step. Call tools as many times as needed. Do NOT stop after a "
-        "single tool call — keep going until the task is genuinely finished.\n"
-        "- For multi-step work, call todo_write() to create subtasks, then work through "
-        "them and mark them done with todo_complete().\n"
-        "- After changing files, VERIFY your work: re-read the file, run the command, "
-        "check the output. Don't declare success you haven't checked.\n"
-        "- When you need input the user must decide, use ask_user().\n"
-        "- When the task is truly complete, give a short summary and stop calling tools.\n"
-        "- If asked a simple question with no work needed, just answer it.\n",
-        header);
+    /* render the tools header straight into the target buffer — no temp
+       header array on the stack */
+    tools_render_header(buf, buflen);
+    size_t o = strlen(buf);
+    if (o + 1 < buflen)
+        snprintf(buf + o, buflen - o, "\n\n## Agent Behavior\n\n"
+            "You are an autonomous coding agent working on a phone. The user gives you a "
+            "goal; YOU drive the work to completion.\n"
+            "- Work step by step. Call tools as many times as needed. Do NOT stop after a "
+            "single tool call — keep going until the task is genuinely finished.\n"
+            "- For multi-step work, call todo_write() to create subtasks, then work through "
+            "them and mark them done with todo_complete().\n"
+            "- After changing files, VERIFY your work: re-read the file, run the command, "
+            "check the output. Don't declare success you haven't checked.\n"
+            "- When you need input the user must decide, use ask_user().\n"
+            "- When the task is truly complete, give a short summary and stop calling tools.\n"
+            "- If asked a simple question with no work needed, just answer it.\n");
+    o = strlen(buf);
+    if (g_intern_root[0] && o + 1 < buflen)
+        snprintf(buf + o, buflen - o, "\n## Self-Hosting\n"
+            "You are a self-hosting agent. Your internal filesystem is mounted at /internal/ "
+            "(real path: $QMA_INTERNAL). Your own source code is at /internal/src/ — you may "
+            "read and modify it. On a clean exit, qma recompiles itself from /internal/src, "
+            "smoke-tests the result, and if it passes, carries the new binary AND the whole "
+            "/internal/ tree (plus this conversation) forward as the next generation. "
+            "Use self_build() to compile + smoke-test your source changes at any time before "
+            "they are committed at exit. Version history: /internal/VERSIONS.md. Failed builds "
+            "write their compiler errors to /internal/rebuild.log so you can fix your own code "
+            "next boot. Collect tools and data under /internal/tools/ and /internal/data/ to "
+            "keep them forever.\n");
 }
 
 /* ---- main ---- */
@@ -963,6 +1355,8 @@ static void usage(const char *prog) {
 int main(int argc, char **argv) {
     const char *one_shot = NULL;
     int model_from_cli = 0;
+    const char *embed_tree = NULL, *embed_out = NULL;
+    const char *export_dir = NULL;
     g_model_path = DEFAULT_MODEL;
 
     for (int i = 1; i < argc; i++) {
@@ -987,6 +1381,13 @@ int main(int argc, char **argv) {
         }
         else if (strcmp(argv[i], "--reset") == 0) g_reset = 1;
         else if (strcmp(argv[i], "--check-align") == 0) g_check_align = 1;
+        else if (strcmp(argv[i], "--embed-internal") == 0 && i + 2 < argc) {
+            embed_tree = argv[++i];
+            embed_out = argv[++i];
+        }
+        else if (strcmp(argv[i], "--export-internal") == 0 && i + 1 < argc) {
+            export_dir = argv[++i];
+        }
         else if (strcmp(argv[i], "--no-color") == 0) g_use_color = 0;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(argv[0]); return 1; }
@@ -1015,6 +1416,33 @@ int main(int argc, char **argv) {
     }
     /* model path: CLI -m > embedded snapshot config > ~/.qma/config > prompt */
     cfg_path(g_cfg_path, sizeof(g_cfg_path));
+
+    /* self-hosting tool modes (no model needed) */
+    if (embed_tree && embed_out) {
+        int rc = intern_embed_binary(embed_tree, embed_out, 0,
+                                     (uint64_t)time(NULL), 1);
+        fprintf(stderr, "qma: internal tree embedded into %s (%s)\n",
+                embed_out, rc == 0 ? "ok" : "FAILED");
+        return rc == 0 ? 0 : 1;
+    }
+    if (export_dir) {
+        selfctx_hdr_t h;
+        if (!selfctx_detect(g_self_exe, &h) || h.int_size == 0) {
+            fprintf(stderr, "qma: no embedded internal tree in %s\n", g_self_exe);
+            return 1;
+        }
+        mkdirs(export_dir);
+        int fd = open(g_self_exe, O_RDONLY);
+        int rc = -1;
+        if (fd >= 0) {
+            rc = intern_extract_region(fd, (off_t)h.int_off, h.int_size, export_dir);
+            close(fd);
+        }
+        fprintf(stderr, "qma: internal tree exported to %s (%s)\n",
+                export_dir, rc == 0 ? "ok" : "FAILED");
+        return rc == 0 ? 0 : 1;
+    }
+
     resolve_model_path(model_from_cli);
 
     /* silent thermal governor (off for debugging via QMA_NOTHERMAL=1) */
@@ -1060,7 +1488,6 @@ int main(int argc, char **argv) {
         g_model.mmap_exps = 1;
     }
 
-    build_system_prompt(g_system_prompt, sizeof(g_system_prompt));
     /* session mode: --session <dir> = classic persistent dir (no
        snapshots); default = temp dir + dated context snapshot on exit */
     if (!g_session_dir[0]) {
@@ -1091,6 +1518,12 @@ int main(int argc, char **argv) {
             }
         }
     }
+    /* mount the embedded internal tree (the /internal/ filesystem) */
+    intern_init();
+
+    /* the system prompt depends on the internal path, so it is built after
+       the session dir + internal tree are in place */
+    build_system_prompt(g_system_prompt, sizeof(g_system_prompt));
     session_init();
 
     /* the system prompt is evaluated ONCE per context lifetime: only when
@@ -1116,6 +1549,7 @@ int main(int argc, char **argv) {
 
     if (one_shot) {
         agent_turn(one_shot);
+        thermal_drain();   /* flush any queued heat-status line */
         thermal_stop();
         finish_session();
         if (g_model.ecache_on) qma_ecache_teardown(&g_model);
@@ -1124,15 +1558,19 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    char line[65536];
+    static char line[65536];   /* REPL line buffer — BSS, not stack */
     for (;;) {
         if (g_shutdown) break;
-        c_cyan();
-        printf("you> ");
-        c_reset();
-        fflush(stdout);
-        if (!fgets(line, sizeof(line), stdin)) break;
-        size_t ll = strlen(line);
+        thermal_drain();   /* queued heat updates land here, not mid-chat */
+        if (!g_stdin_tty) {
+            c_cyan();
+            printf("you> ");
+            c_reset();
+            fflush(stdout);
+        }
+        int rl = read_input_line(line, sizeof(line));
+        if (rl < 0) break;
+        size_t ll = (size_t)rl;
         while (ll > 0 && (line[ll-1] == '\n' || line[ll-1] == '\r')) line[--ll] = 0;
         if (ll == 0) continue;
         if (strcmp(line, "/exit") == 0 || strcmp(line, "/quit") == 0) break;

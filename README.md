@@ -5,6 +5,13 @@ autonomous coding agent entirely on-device, on a phone. There is no Python
 runtime, no HTTP server, no separate inference process — the model engine,
 the agent loop, and the tools the agent calls all live in one executable.
 
+qma is also **self-hosting**: the binary embeds its own source tree (and
+anything the agent collects). The agent can read and modify its own code
+through an internal filesystem (`/internal/`), test changes with
+`self_build()`, and on a clean exit qma recompiles itself from the edited
+source, smoke-tests the result, and carries the new binary — plus the whole
+conversation and the internal tree — forward as the next generation.
+
 It's tuned for `qwen3.6:35b:a3b` (the `qwen35moe` architecture: 30 recurrent
 "gated delta net" layers plus 10 full-attention layers, a MoE FFN with 256
 experts routed top-8 plus a shared expert) running on a Samsung Galaxy S25
@@ -58,6 +65,19 @@ track, back up, or lose. Passing `--session <dir>` instead uses a normal
 persistent directory (`kv.bin`, `state.bin`, `salience.bin`) if you'd rather
 manage sessions that way, or run several in parallel.
 
+**Self-hosting.** The same tail that carries the session also carries the
+agent's own source tree — `src/`, the Makefile, the README, plus any tools
+or data the agent collects — as an embedded blob (`intern.c`). At boot it is
+extracted to `<session>/internal/` and mounted as `/internal/` for the
+agent's file tools (`$QMA_INTERNAL` holds the real path for `bash`). On a
+clean exit qma recompiles itself from `/internal/src` (same flags as the
+Makefile), smoke-tests the fresh binary, and if it passes, embeds the whole
+internal tree + the conversation into the next generation binary
+(`qma-gen<N>-<timestamp>`). If the rebuild fails, the current binary is kept
+and the compiler errors land in `/internal/rebuild.log` so the agent can
+fix its own code next boot. Generations are pruned to the newest one (the
+original base binary is always kept).
+
 **Thermal governor.** A background thread watches CPU and battery
 temperature every few seconds and quietly shrinks the worker thread pool
 (and, if things get hot enough, restricts work to the phone's efficiency
@@ -83,7 +103,7 @@ Tools available to the model: `pwd`, `ls`, `find`, `grep`, `read`, `write`,
 `edit` (exact-text-match replacement, several edits per call), `replace_lines`,
 `insert_lines`, `delete_lines`, `bash`, `enter` (change directory),
 `todo_write` / `todo_complete` / `todo_remove`, `write_diary` / `read_diary`,
-and `ask_user`.
+`ask_user`, and `self_build` (compile + smoke-test the agent's own source).
 
 A turn works like this: the user's message is added to the running KV cache,
 the model generates a response — thinking shown dimmed, regular content shown
@@ -91,6 +111,14 @@ normally, tool calls shown as they're emitted — and if the model called any
 tools, each one runs and its result is fed back in as a `<tool_response>`
 before the model generates again. This repeats until the model responds with
 plain text and no tool calls, which ends the turn.
+
+The agent is self-aware about its own code: `/internal/` is its internal
+filesystem (source in `/internal/src/`, version history in
+`/internal/VERSIONS.md`, last failed build's errors in
+`/internal/rebuild.log`). It may modify its own source, collect tools and
+data under `/internal/tools/` and `/internal/data/` to carry forever, and
+verify its edits at any time with `self_build()` before qma commits them at
+exit.
 
 ## Building
 
@@ -127,6 +155,9 @@ qma -p "prompt"            one-shot, non-interactive
 | `--workdir <dir>` | working directory for the agent's file/shell tools |
 | `--reset` | clear the current session's context and start over |
 | `--no-color` | disable ANSI colors in the terminal output |
+| `--check-align` | print whether the model file is 4K-aligned (O_DIRECT-ready) and exit |
+| `--embed-internal <tree> <outfile>` | append the internal-tree blob to a freshly built binary (used by `make`) |
+| `--export-internal <dir>` | extract this binary's embedded internal tree to a directory |
 | `-h` / `--help` | show usage |
 
 Interactive commands: `/exit`, `/quit`, `/reset`, `/clear`.
@@ -137,8 +168,12 @@ Interactive commands: `/exit`, `/quit`, `/reset`, `/clear`.
   Resolution order: `-m` flag → config embedded in a snapshot binary →
   `~/.qma/config` → interactive prompt. If the chosen file doesn't exist,
   qma reprompts for a path; in non-interactive mode it errors out.
+- The `you> ` prompt is a small line editor on a real terminal: Left/Right
+  move the cursor (UTF-8 aware), Up/Down walk your prompt history,
+  Backspace/Delete edit at the cursor, Home/End jump, Enter submits.
+  Non-tty input (pipes, scripts) falls back to plain line reads.
 - Press `ESC` during generation to cancel the current turn and return to the
-  `you>` prompt (the partial reply stays in the context, closed off cleanly).
+  `you> ` prompt (the partial reply stays in the context, closed off cleanly).
   `Ctrl-C` still shuts the program down.
 
 
@@ -148,6 +183,8 @@ These toggle debug output or opt out of a subsystem that's normally on:
 
 | Variable | Effect |
 |---|---|
+| `QMA_INTERNAL=<path>` | real path of the mounted internal tree (set at boot; use it in `bash`) |
+| `QMA_NOALIGN=1` | skip the one-time 4K-alignment repack of the model file |
 | `QMA_NOTHERMAL=1` | turn off the thermal governor |
 | `QMA_NOYALIS=1` | turn off predictive expert prefetching |
 | `QMA_NOEVICT=1` | turn off tiered context memory (attend to everything instead) |
@@ -176,15 +213,34 @@ src/
   toolparse.c/.h       parses <tool_call> output into structured calls
   grammar.c/.h         constrains sampling to valid tool-call syntax
   selfctx.c/.h         embeds/extracts a session in the binary's own file
+  intern.c/.h          embedded internal tree: embed/extract, rebuild, version log
   thermal.c/.h         thermal governor
   json.c/.h            JSON parser/encoder
 ```
 
+The internal tree embedded in every binary (mounted at `/internal/`):
+
+```
+internal/
+  src/                  the engine source (what qma recompiles from at exit)
+  Makefile, README.md
+  tools/, data/         collected by the agent, carried forward forever
+  VERSIONS.md           generation history
+  rebuild.log           last failed build's compiler errors (if any)
+```
+
 ## Tests
 
-`make test` builds and runs three test suites — for tool-call parsing,
-session snapshotting, and tool-call grammar — each linking only the source
-files it needs, without loading a model.
+`make test` builds and runs the unit suites under `tests/` (each links only
+the source files it needs, without loading a model):
+
+- `tests/test_grammar.c` — grammar fast-path parity: the state-based
+  `grammar_tool_open_state` + `grammar_tool_token_from_state` must agree
+  with the reference wrapper across a battery of call states.
+- `tests/test_intern.c` — internal-tree blob round trip: embed a tree,
+  extract it, verify every file byte-for-byte, probe the generation serial.
+
+The toolparse and session-snapshot suites are planned.
 
 
 ##DISCLAIMER:

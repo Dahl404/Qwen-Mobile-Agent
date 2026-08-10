@@ -26,13 +26,6 @@ typedef struct {
  */
 int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc);
 
-/* Parse all complete, VALID blocks; open blocks end the scan; malformed
- * complete blocks are skipped. Returns count. */
-int parse_tool_calls(const char *text, tool_call_t *calls, int max);
-
-/* 1 while a <tool_call> block is open (and already declares <function=). */
-int tool_block_open(const char *ans, size_t ans_len);
-
 /* Grammar mask while a call is open (see toolparse.c). */
 void mask_tool_grammar(const qma_t *m, float *logits, const char *ans, size_t ans_len);
 

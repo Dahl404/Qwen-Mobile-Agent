@@ -173,39 +173,6 @@ int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc) {
     return 1;
 }
 
-int parse_tool_calls(const char *text, tool_call_t *calls, int max) {
-    int n = 0;
-    const char *p = text;
-    while (n < max && (p = strstr(p, "<tool_call>")) != NULL) {
-        int r = parse_one_tool_call(text, &p, &calls[n]);
-        if (r == 0) break;
-        if (r == 1) n++;
-    }
-    return n;
-}
-
-int tool_block_open(const char *ans, size_t ans_len) {
-    const char *p = ans;
-    const char *e = ans + ans_len;
-    while (p < e) {
-        const char *a = strstr(p, "<tool_call>");
-        const char *b = strstr(p, "</tool_call>");
-        if (!a && !b) break;
-        if (!b || (a && a < b)) {
-            const char *nb = strstr(a + strlen("<tool_call>"), "</tool_call>");
-            if (!nb) {
-                const char *fn = strstr(a, "<function=");
-                if (fn) return 1;
-                break;
-            }
-            p = a + strlen("<tool_call>");
-        } else {
-            p = b + strlen("</tool_call>");
-        }
-    }
-    return 0;
-}
-
 /* Grammar-constrained sampling during an open tool call (the llama.cpp
    approach: mask illegal tokens at every step so the model CANNOT produce
    a malformed call, instead of parsing garbage after the fact).

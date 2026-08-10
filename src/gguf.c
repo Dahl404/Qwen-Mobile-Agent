@@ -128,7 +128,7 @@ int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
     /* magic + version */
     if (memcmp(r.p, "GGUF", 4) != 0) { snprintf(err, errlen, "not a GGUF file"); return -1; }
     r.p += 4;
-    uint32_t version = rd_u32(&r);
+    rd_u32(&r);   /* version (unused) */
     uint64_t n_tensors = rd_u64(&r), n_kv = rd_u64(&r);
 
     /* ------- metadata ------- */
@@ -296,7 +296,7 @@ int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
             if (strcmp(m->tensors[i].name, nm) == 0) { dst = m->data + m->tensors[i].off; tt = m->tensors[i].type; break; } \
         if (!dst) { snprintf(err, errlen, "missing tensor: %s", nm); return -1; } \
     } while (0)
-    #define FIND(dst, nm) do { uint32_t _t; FIND_T(dst, _t, nm); } while (0)
+    #define FIND(dst, nm) do { uint32_t _t; FIND_T(dst, _t, nm); (void)_t; } while (0)
     /* like FIND_T but also records the tensor's absolute file offset */
     #define FIND_TOFF(dst, tt, offp, nm) do { \
         dst = NULL; tt = 0; offp = 0; \

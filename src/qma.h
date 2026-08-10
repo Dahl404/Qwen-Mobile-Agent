@@ -310,7 +310,6 @@ void     runstate_free(runstate_t *rs);
 /* weight streaming: prefetch setup + per-layer lookahead (dist layers) */
 void     qma_prefetch_init(qma_t *m);
 void     qma_prefetch_layer(int il, int dist, qma_t *m);
-void     qma_debug_enable(void);
 
 /* expert streaming cache (waste-style): arm with a byte budget + reader
    threads after load; teardown before free. budget 0 = off. */
