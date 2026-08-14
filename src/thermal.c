@@ -192,14 +192,37 @@ static void set_proc_affinity(int eff_only) {
     closedir(d);
 }
 
+static pthread_mutex_t g_pending_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_pending[256];       /* last queued status line (drained by app) */
+static int  g_pending_len = 0;
+
+/* called from the thermal thread on level change: stash the line instead of
+   printing it mid-generation (last change wins — it's a current-state readout) */
+static void thermal_note(const char *msg) {
+    pthread_mutex_lock(&g_pending_mu);
+    snprintf(g_pending, sizeof(g_pending), "%s", msg);
+    g_pending_len = 1;
+    pthread_mutex_unlock(&g_pending_mu);
+}
+
+void thermal_drain(void) {
+    pthread_mutex_lock(&g_pending_mu);
+    int have = g_pending_len;
+    g_pending_len = 0;
+    if (have) fprintf(stderr, "%s\n", g_pending);
+    pthread_mutex_unlock(&g_pending_mu);
+}
+
 static void apply_level(int level) {
     if (level == g_level) return;
     qma_pool_set_max(WORKERS_BY_LEVEL[level]);   /* 0 = all workers */
     set_proc_affinity(level >= 3);               /* eff cores only at 3 */
     g_level = level;
-    fprintf(stderr, "[thermal] level %d%s\n", level,
+    char msg[256];
+    snprintf(msg, sizeof(msg), "[thermal] level %d%s", level,
             level == 3 ? " — efficiency cores, 2 workers" :
             level > 0 ? " — trimming workers" : " — full speed again");
+    thermal_note(msg);
 }
 
 static void *thermal_loop(void *arg) {

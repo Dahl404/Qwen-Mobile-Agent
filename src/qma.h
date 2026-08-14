@@ -164,6 +164,7 @@ typedef struct {
 typedef struct {
     /* mmap */
     int      fd;
+    int      dio_fd;   /* >= 0: O_DIRECT fd for expert reads (4K-aligned file) */
     uint8_t *map;
     size_t   map_size;
     uint8_t *data;      /* start of tensor data section */
@@ -309,7 +310,6 @@ void     runstate_free(runstate_t *rs);
 /* weight streaming: prefetch setup + per-layer lookahead (dist layers) */
 void     qma_prefetch_init(qma_t *m);
 void     qma_prefetch_layer(int il, int dist, qma_t *m);
-void     qma_debug_enable(void);
 
 /* expert streaming cache (waste-style): arm with a byte budget + reader
    threads after load; teardown before free. budget 0 = off. */
@@ -334,7 +334,8 @@ int      qma_detokenize(qma_t *m, const int *tokens, int n, char *out, int max_o
 /* sampler */
 void     sampler_init(sampler_t *s, uint64_t seed, float temp, int top_k, float top_p, float repeat_penalty);
 /* two-phase sampling (llama.cpp chain shape): candidates, then pick.
-   Between them, a grammar filter may mask candidates (logit = -1e30f). */
+   No grammar filter between them (see agent.c) — tool-call validity is
+   enforced by policy, not token masking. */
 int      sampler_candidates(int n_vocab, const float *logits, sampler_t *s,
                            int *ids, float *lgs, int max_k);
 int      sampler_pick(sampler_t *s, const int *ids, float *lgs, int n, float top_p);
@@ -363,5 +364,13 @@ float    qma_q8k_dot(const void *row, int wtype, const int8_t *xq,
 void     qma_q8k_gateup(const void *g, const void *u, const int8_t *xq,
                            const float *xd, const int16_t *xsum, int n,
                            float *gate, float *up);
+
+/* one-time model alignment (see gguf.c): 1 = needs 4K repack, 0 = aligned,
+   -1 = error */
+int      qma_model_needs_align(const char *path, char *err, size_t errlen);
+/* ensure O_DIRECT-able file: repacks to <src>.4k if needed; *use_path gets
+   the file to load (== src when already aligned) */
+int      qma_align_model(const char *src, char *use_path, size_t use_len,
+                           char *err, size_t errlen);
 
 #endif /* QMA_H */

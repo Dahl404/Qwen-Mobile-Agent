@@ -1,8 +1,10 @@
 /* sampler.c - temperature / top-k / top-p / repeat-penalty sampling.
  * Split into two phases (llama.cpp sampler-chain shape):
  *   sampler_candidates() — repeat penalty + temp + top-k  -> candidate list
- *   sampler_pick()       — grammar-masked candidates + top-p + sample
- * The grammar filter runs between them (see agent.c / grammar.c). */
+ *   sampler_pick()       — top-p + sample
+ * There is no grammar filter anymore (see agent.c): tool-call validity is
+ * enforced by policy (one complete call per turn, then the engine
+ * force-ends the turn and folds the result back). */
 #include "qma.h"
 
 static uint64_t rng_next(uint64_t *s) {
@@ -94,9 +96,10 @@ int sampler_candidates(int n_vocab, const float *logits, sampler_t *s,
     return k;
 }
 
-/* Phase 2: top-p + sample from the (possibly grammar-masked) candidates.
-   Masked candidates carry logit -1e30f. If every candidate is masked,
-   fall back to the top one (the parser backstop catches any bad output). */
+/* Phase 2: top-p + sample from the candidates. Masked candidates carry
+   logit -1e30f (control tokens pre-masked upstream). If every candidate is
+   masked, fall back to the top one (the parser backstop catches any bad
+   output). */
 int sampler_pick(sampler_t *s, const int *ids, float *lgs, int n, float top_p) {
     if (n <= 0) return 0;
     int first_live = -1;

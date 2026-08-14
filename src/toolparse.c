@@ -80,31 +80,83 @@ static int val_roundtrips_valid(const char *s, size_t len) {
     return 1;
 }
 
-/* Find the </parameter> close for the value at vstart: the FIRST close after
- * which the value round-trips to valid JSON. Returns NULL when none. */
-static const char *param_close(const char *vstart, const char *end) {
+/* Find the close for the value at vstart: the FIRST close after which the
+ * value round-trips to valid JSON. Accepted closes:
+ *   </parameter>             — the canonical tag from the model's template
+ *   </KEY>                  — HTML-style close the model improvises
+ *                             (e.g. <parameter=start_line> 120</start_line>)
+ *   </arg...>               — the "arguments" family (</arg_value>, </args>)
+ * Any other '</' sequence does NOT close a value — so a bash command like
+ * 'cat < /dev/null' keeps its value intact. Returns the close position and
+ * its tag length, or NULL when none (truncated value). */
+static const char *value_close(const char *vstart, const char *end,
+                               const char *key, size_t keylen, size_t *tlen) {
     const char *scan = vstart;
     for (;;) {
+        /* canonical </parameter> */
         const char *c = strstr(scan, "</parameter>");
-        if (!c || (end && c > end)) return NULL;
-        size_t vl = (size_t)(c - vstart);
+        if (c && end && c > end) c = NULL;
+        /* improvised </KEY> / </arg...> */
+        const char *g = NULL; size_t gl = 0;
+        for (const char *s = scan; s + 2 <= end; s++) {
+            if (s[0] == '<' && s[1] == '/') {
+                const char *w = s + 2, *w2 = w;
+                while (w2 < end && ((*w2 >= 'a' && *w2 <= 'z') ||
+                                    (*w2 >= 'A' && *w2 <= 'Z') ||
+                                    (*w2 >= '0' && *w2 <= '9') || *w2 == '_')) w2++;
+                if (w2 < end && *w2 == '>' && w2 > w) {
+                    size_t wl = (size_t)(w2 - w);
+                    if ((keylen && wl == keylen && strncasecmp(w, key, keylen) == 0) ||
+                        (wl >= 3 && strncasecmp(w, "arg", 3) == 0)) {
+                        g = s; gl = (size_t)(w2 - s) + 1;
+                        break;
+                    }
+                }
+                s = w2;   /* skip past this non-close </word> */
+            }
+        }
+        const char *best = NULL; size_t bt = 0;
+        if (c && (!g || c <= g)) { best = c; bt = strlen("</parameter>"); }
+        else if (g) { best = g; bt = gl; }
+        if (!best || (end && best > end)) return NULL;
+        size_t vl = (size_t)(best - vstart);
         while (vl > 0 && (vstart[vl-1]=='\n'||vstart[vl-1]=='\r'||
                           vstart[vl-1]==' '||vstart[vl-1]=='\t')) vl--;
-        if (val_roundtrips_valid(vstart, vl)) return c;
-        scan = c + strlen("</parameter>");
+        if (val_roundtrips_valid(vstart, vl)) { *tlen = bt; return best; }
+        scan = best + 1;
     }
 }
 
 int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc) {
     const char *p = *ppos;
-    const char *body = p + strlen("<tool_call>");
-    const char *end = strstr(body, "</tool_call>");
-    if (!end) return 0;                     /* still open */
-    *ppos = end + strlen("</tool_call>");
+    /* block start: the <tool_call> opener if it precedes a <function=, else
+       a bare <function= (the model without a grammar mask frequently drops
+       the opener). */
+    const char *opener = strstr(p, "<tool_call>");
+    const char *fn = strstr(p, "<function=");
+    if (fn && opener && opener < fn)
+        fn = strstr(opener + strlen("<tool_call>"), "<function=");
+    /* block end: first of </function> or </tool_call> after the block start */
+    const char *blk = fn ? fn : (opener ? opener : p);
+    const char *fe = strstr(blk, "</function>");
+    const char *tce = strstr(blk, "</tool_call>");
+    const char *end;
+    if (fe && (!tce || fe < tce)) end = fe;
+    else if (tce) end = tce;
+    else return 0;                          /* still open: wait for more tokens */
+    if (fe && end == fe) {
+        *ppos = fe + strlen("</function>");
+        /* consume trailing whitespace + an adjacent </tool_call> close */
+        const char *w = *ppos;
+        while (*w == '\n' || *w == '\r' || *w == ' ' || *w == '\t') w++;
+        if (strncmp(w, "</tool_call>", strlen("</tool_call>")) == 0)
+            *ppos = w + strlen("</tool_call>");
+    } else {
+        *ppos = tce + strlen("</tool_call>");
+    }
+    if (!fn) return -1;                     /* block but no function: malformed */
     tc->name[0] = 0;
     tc->args[0] = 0;
-    const char *fn = strstr(body, "<function=");
-    if (!fn || fn >= end) return -1;
     const char *fn_end = strchr(fn + strlen("<function="), '>');
     if (!fn_end || fn_end >= end) return -1;
     size_t nlen = (size_t)(fn_end - (fn + strlen("<function=")));
@@ -112,7 +164,8 @@ int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc) {
     memcpy(tc->name, fn + strlen("<function="), nlen);
     tc->name[nlen] = 0;
     if (tc->name[0] == 0) return -1;
-    /* parameters: <parameter=KEY>\nVALUE\n</parameter> */
+    /* parameters: <parameter=KEY>VALUE</CLOSE>; the value may sit on the
+       same line as its tag (inline) or on following lines */
     char (*keys)[256] = malloc((size_t)MAX_TOOL_ARGS * 256);
     char (*vals)[16384] = malloc((size_t)MAX_TOOL_ARGS * 16384);
     if (!keys || !vals) { free(keys); free(vals); return -1; }
@@ -128,8 +181,10 @@ int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc) {
         memcpy(keys[na], pm + strlen("<parameter="), klen);
         keys[na][klen] = 0;
         const char *vstart = pm_end + 1;
-        while (*vstart == '\n' || *vstart == '\r') vstart++;
-        const char *vclose = param_close(vstart, end);
+        while (*vstart == '\n' || *vstart == '\r' ||
+               *vstart == ' ' || *vstart == '\t') vstart++;
+        size_t vtlen = 0;
+        const char *vclose = value_close(vstart, end, keys[na], klen, &vtlen);
         if (!vclose) { bad = 1; break; }    /* truncated value: malformed */
         size_t vlen = (size_t)(vclose - vstart);
         while (vlen > 0 && (vstart[vlen-1]=='\n'||vstart[vlen-1]=='\r'||
@@ -138,7 +193,7 @@ int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc) {
         memcpy(vals[na], vstart, vlen);
         vals[na][vlen] = 0;
         na++;
-        q = vclose + strlen("</parameter>");
+        q = vclose + vtlen;
     }
     if (bad) { free(keys); free(vals); return -1; }
     /* build JSON arguments {"k":v,...} */
@@ -171,130 +226,6 @@ int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc) {
     free(keys); free(vals);
     if (!json_valid(tc->args)) return -1;   /* refuse malformed args */
     return 1;
-}
-
-int parse_tool_calls(const char *text, tool_call_t *calls, int max) {
-    int n = 0;
-    const char *p = text;
-    while (n < max && (p = strstr(p, "<tool_call>")) != NULL) {
-        int r = parse_one_tool_call(text, &p, &calls[n]);
-        if (r == 0) break;
-        if (r == 1) n++;
-    }
-    return n;
-}
-
-int tool_block_open(const char *ans, size_t ans_len) {
-    const char *p = ans;
-    const char *e = ans + ans_len;
-    while (p < e) {
-        const char *a = strstr(p, "<tool_call>");
-        const char *b = strstr(p, "</tool_call>");
-        if (!a && !b) break;
-        if (!b || (a && a < b)) {
-            const char *nb = strstr(a + strlen("<tool_call>"), "</tool_call>");
-            if (!nb) {
-                const char *fn = strstr(a, "<function=");
-                if (fn) return 1;
-                break;
-            }
-            p = a + strlen("<tool_call>");
-        } else {
-            p = b + strlen("</tool_call>");
-        }
-    }
-    return 0;
-}
-
-/* Grammar-constrained sampling during an open tool call (the llama.cpp
-   approach: mask illegal tokens at every step so the model CANNOT produce
-   a malformed call, instead of parsing garbage after the fact).
-
-   While a <tool_call> block is open:
-   - control tokens (<|im_end|> etc) are forbidden (existing fix),
-   - the single-token tags <think> </think> <tool_call> <tool_response>
-     </tool_response> are forbidden — the observed re-draft/cascade
-     failures were exactly these tokens appearing mid-call (</tool_call>
-     stays allowed so the call can close),
-   - inside an open parameter value, '<' and '>' tokens are forbidden
-     while the value is an INCOMPLETE JSON structure (so a nested
-     <function=/<parameter= can never appear, and the value must finish
-     before </parameter> is reachable). Bare-text values and closed JSON
-     keep '<' so the close tag stays reachable — no deadlock. */
-
-/* value constraint: 0 = '<' allowed, 2 = '<'/'>' forbidden */
-static int value_lt_state(const char *ans, size_t ans_len) {
-    const char *e = ans + ans_len;
-    /* the open block: last "<tool_call>" with no "</tool_call>" after */
-    const char *tc = NULL, *p = ans;
-    while ((p = strstr(p, "<tool_call>")) != NULL) {
-        const char *close = strstr(p + strlen("<tool_call>"), "</tool_call>");
-        if (!close || close >= e) { tc = p; break; }
-        p = close + strlen("</tool_call>");
-    }
-    if (!tc) return 0;
-    /* the last "<parameter=" in the block with no "</parameter>" after */
-    const char *pm = NULL, *q = tc;
-    while ((q = strstr(q, "<parameter=")) != NULL && q < e) {
-        const char *pc = strstr(q + strlen("<parameter="), "</parameter>");
-        if (!pc || pc >= e) { pm = q; break; }
-        q = pc + strlen("</parameter>");
-    }
-    if (!pm) return 0;
-    const char *vstart = strchr(pm + strlen("<parameter="), '>');
-    if (!vstart || vstart >= e) return 0;
-    vstart++;
-    while (vstart < e && (*vstart == '\n' || *vstart == '\r')) vstart++;
-    const char *vend = strstr(vstart, "</parameter>");
-    if (vend && vend < e) return 0;   /* value already closed */
-    size_t vlen = (size_t)(e - vstart);
-    size_t i = 0;
-    while (i < vlen && (vstart[i]==' '||vstart[i]=='\t')) i++;
-    if (i >= vlen) return 0;          /* empty value */
-    char c = vstart[i];
-    if (c == '"') {
-        /* in-string (odd unescaped quotes): '<' is legal string content */
-        int in_str = 0, esc = 0;
-        for (size_t j = 0; j < vlen; j++) {
-            if (esc) { esc = 0; continue; }
-            if (vstart[j] == '\\') { esc = 1; continue; }
-            if (vstart[j] == '"') in_str = !in_str;
-        }
-        if (in_str) return 0;
-        /* closed: complete JSON string -> '<' allowed (close reachable) */
-        char tmp[16384];
-        size_t n = vlen; if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
-        memcpy(tmp, vstart, n); tmp[n] = 0;
-        return json_valid(tmp) ? 0 : 2;
-    }
-    if (c == '[' || c == '{' || c == '-' || (c >= '0' && c <= '9')) {
-        char tmp[16384];
-        size_t n = vlen; if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
-        memcpy(tmp, vstart, n); tmp[n] = 0;
-        return json_valid(tmp) ? 0 : 2;
-    }
-    return 0;   /* bare text: '<' allowed so the close tag stays reachable */
-}
-
-void mask_tool_grammar(const qma_t *m, float *logits, const char *ans, size_t ans_len) {
-    int vs = value_lt_state(ans, ans_len);
-    for (int i = 0; i < m->n_vocab; i++) {
-        if (m->tok_type[i] & 4) { logits[i] = -1e30f; continue; }   /* control */
-        if (m->tok_type[i] & 8) {
-            /* think/tool tags are single tokens — forbidden mid-call,
-               except </tool_call> which closes the block */
-            const char *t = m->tok_text[i];
-            if (t && (strcmp(t, "<think>") == 0 || strcmp(t, "</think>") == 0 ||
-                      strcmp(t, "<tool_call>") == 0 ||
-                      strcmp(t, "<tool_response>") == 0 ||
-                      strcmp(t, "</tool_response>") == 0))
-                logits[i] = -1e30f;
-            continue;
-        }
-        if (vs == 2 && m->tok_text[i] &&
-            (strchr(m->tok_text[i], '<') || strchr(m->tok_text[i], '>')))
-            logits[i] = -1e30f;
-    }
 }
 
 size_t u8_safe_len(const char *s, size_t len) {

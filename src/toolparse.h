@@ -3,8 +3,9 @@
  * tested fixes): a parameter only closes at the first </parameter> after
  * which its value round-trips to valid JSON, so truncated/malformed calls
  * are never shipped — parse_one_tool_call returns -1 and the caller drops
- * them. control-token masking (tool_block_open + mask_control_tokens) stops
- * the model's inflated <|im_end|> logits from truncating a call mid-args.
+ * them. There is NO grammar mask on generation (ma3 scope decision): calls
+ * are constrained by policy instead — one complete call per turn, then the
+ * engine force-ends the turn and folds the result back.
  */
 #ifndef TOOLPARSE_H
 #define TOOLPARSE_H
@@ -25,16 +26,6 @@ typedef struct {
  *   -1  complete but malformed (dropped)
  */
 int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc);
-
-/* Parse all complete, VALID blocks; open blocks end the scan; malformed
- * complete blocks are skipped. Returns count. */
-int parse_tool_calls(const char *text, tool_call_t *calls, int max);
-
-/* 1 while a <tool_call> block is open (and already declares <function=). */
-int tool_block_open(const char *ans, size_t ans_len);
-
-/* Grammar mask while a call is open (see toolparse.c). */
-void mask_tool_grammar(const qma_t *m, float *logits, const char *ans, size_t ans_len);
 
 /* length of s[0..len) that forms complete UTF-8 characters */
 size_t u8_safe_len(const char *s, size_t len);

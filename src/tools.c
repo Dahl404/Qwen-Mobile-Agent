@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include "tools.h"
 #include "json.h"
+#include "intern.h"
 
 /* ---------------- schemas ---------------- */
 
@@ -56,7 +57,7 @@ const tool_schema_t g_tools[] = {
      "Execute bash commands in the current working directory",
      "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout\":{\"type\":\"integer\",\"default\":60}},\"required\":[\"command\"]}"},
     {"enter",
-     "Change current working directory",
+     "Change current working directory; the qma binary physically moves to the new directory (so the next self-hosted generation is written there)",
      "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}"},
     {"todo_write",
      "Replace entire todo list. Pass array of {content, priority, completed}.",
@@ -87,6 +88,9 @@ const tool_schema_t g_tools[] = {
      "{\"type\":\"object\",\"properties\":{\"duration_ms\":{\"type\":\"integer\",\"default\":500}}}"},
     {"battery",
      "Report phone battery status (level, charging state, health, temperature) as JSON.",
+     "{\"type\":\"object\",\"properties\":{}}"},
+    {"self_build",
+     "Compile the internal source tree (/internal/src) with the same flags as the Makefile and smoke-test the result. Call after editing your own code to verify it before qma commits it at exit.",
      "{\"type\":\"object\",\"properties\":{}}"},
 };
 
@@ -139,6 +143,37 @@ static char *read_whole_file(const char *path) {
 
 /* ---------------- tool implementations ---------------- */
 
+
+/* ---- internal filesystem mapping ----
+   The agent's internal tree (its own source + collected tools/data) lives
+   at $QMA_INTERNAL, extracted from the binary at boot. Structured tools
+   accept the logical path /internal/... and we rewrite it to the real
+   location; bash uses the $QMA_INTERNAL env var instead. */
+static char g_intern_root[4096] = "";
+void intern_set_root(const char *root) {
+    snprintf(g_intern_root, sizeof(g_intern_root), "%s", root);
+}
+
+/* running binary path — shared with agent.c (which resolves it at boot and
+   writes the next-generation snapshot into its directory at exit). t_enter
+   renames the binary to the new cwd and updates this so the lineage follows
+   the agent; finish_session() in agent.c reads the same variable. */
+extern char g_self_exe[1024];
+
+static char g_map_buf[4096];
+/* rewrite "/internal/..." / "internal/..." to <root>/...; otherwise as-is */
+static const char *map_path(const char *p) {
+    const char *rest = NULL;
+    if (!g_intern_root[0] || !p) return p;
+    if (strncmp(p, "/internal/", 10) == 0)    rest = p + 10;
+    else if (strcmp(p, "/internal") == 0)     rest = "";
+    else if (strncmp(p, "internal/", 9) == 0) rest = p + 9;
+    else if (strcmp(p, "internal") == 0)      rest = "";
+    if (!rest) return p;
+    snprintf(g_map_buf, sizeof(g_map_buf), "%s/%s", g_intern_root, rest);
+    return g_map_buf;
+}
+
 static char *t_pwd(void) {
     char buf[4096];
     if (!getcwd(buf, sizeof(buf))) return fmt("ERROR: getcwd: %s", strerror(errno));
@@ -146,7 +181,7 @@ static char *t_pwd(void) {
 }
 
 static char *t_list_dir(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     if (!path[0]) path = ".";
     int hidden = json_bool(json_obj_get(args, "show_hidden"));
     int lng = json_bool(json_obj_get(args, "long_format"));
@@ -184,7 +219,7 @@ static char *t_list_dir(const jval_t *args) {
 
 static char *t_search(const jval_t *args) {
     const char *pattern = json_str(json_obj_get(args, "pattern"));
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     int recursive = json_bool(json_obj_get(args, "recursive"));
     if (!pattern[0]) return fmt("ERROR: pattern is required");
     if (!path[0]) path = ".";
@@ -211,7 +246,7 @@ static char *t_search(const jval_t *args) {
 }
 
 static char *t_read_file(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     int start = (int)json_num(json_obj_get(args, "start_line"));
     int maxl = (int)json_num(json_obj_get(args, "max_lines"));
     char *err = path_guard(path);
@@ -241,7 +276,7 @@ static char *t_read_file(const jval_t *args) {
 }
 
 static char *t_write_file(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     const char *content = json_str(json_obj_get(args, "content"));
     char *err = path_guard(path);
     if (err) return err;
@@ -261,7 +296,7 @@ static char *t_write_file(const jval_t *args) {
 }
 
 static char *t_edit(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     char *err = path_guard(path);
     if (err) return err;
     const jval_t *edits = json_obj_get(args, "edits");
@@ -344,7 +379,7 @@ static char *lines_join(lines_t *ls) {
 }
 
 static char *t_replace_lines(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     int s = (int)json_num(json_obj_get(args, "start_line"));
     int e = (int)json_num(json_obj_get(args, "end_line"));
     const char *nc = json_str(json_obj_get(args, "new_content"));
@@ -386,7 +421,7 @@ static char *t_replace_lines(const jval_t *args) {
 }
 
 static char *t_insert_lines(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     int after = (int)json_num(json_obj_get(args, "after_line"));
     const char *content = json_str(json_obj_get(args, "content"));
     char *err = path_guard(path);
@@ -424,7 +459,7 @@ static char *t_insert_lines(const jval_t *args) {
 }
 
 static char *t_delete_lines(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     int s = (int)json_num(json_obj_get(args, "start_line"));
     int e = (int)json_num(json_obj_get(args, "end_line"));
     char *err = path_guard(path);
@@ -517,12 +552,44 @@ static char *t_execute_command(const jval_t *args) {
 }
 
 static char *t_enter(const jval_t *args) {
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     if (!path[0]) return xstrdup("ERROR: path is required");
     if (chdir(path) != 0) return fmt("ERROR: cannot enter '%s': %s", path, strerror(errno));
     char buf[4096];
     getcwd(buf, sizeof(buf));
-    return fmt("✓ now in %s", buf);
+    char note[1400] = "";
+    /* self-hosting: carry the binary to the new cwd so the NEXT generation
+       is written into the project the agent moved to (finish_session writes
+       the snapshot into g_self_exe's directory). rename() works on a
+       running executable on Linux — the inode stays alive, /proc/self/exe
+       follows the rename, and "Text file busy" only blocks WRITING the
+       binary, which we never do here. Skipped when the binary is already
+       in the target dir, when the target is inside the internal tree (the
+       binary would be embedded into itself at exit), or across
+       filesystems (EXDEV — the cwd move still applies, just reported). */
+    if (g_self_exe[0]) {
+        const char *slash = strrchr(g_self_exe, '/');
+        const char *name = slash ? slash + 1 : g_self_exe;
+        char bindir[1024];
+        if (slash && slash != g_self_exe) {
+            size_t n = (size_t)(slash - g_self_exe);
+            if (n >= sizeof(bindir)) n = sizeof(bindir) - 1;
+            memcpy(bindir, g_self_exe, n); bindir[n] = 0;
+        } else snprintf(bindir, sizeof(bindir), ".");
+        int into_internal = g_intern_root[0] &&
+            strncmp(buf, g_intern_root, strlen(g_intern_root)) == 0;
+        if (strcmp(bindir, buf) != 0 && !into_internal) {
+            char dest[1400];
+            snprintf(dest, sizeof(dest), "%s/%s", buf, name);
+            if (rename(g_self_exe, dest) == 0) {
+                snprintf(g_self_exe, sizeof(g_self_exe), "%s", dest);
+                snprintf(note, sizeof(note), " — binary moved to %s", dest);
+            } else {
+                snprintf(note, sizeof(note), " — binary NOT moved (%s)", strerror(errno));
+            }
+        }
+    }
+    return fmt("✓ now in %s%s", buf, note);
 }
 
 /* ---- todos (in-memory) ---- */
@@ -658,7 +725,7 @@ static void find_walk(const char *base, const char *pattern, char *out, size_t *
 
 static char *t_find(const jval_t *args) {
     const char *pattern = json_str(json_obj_get(args, "pattern"));
-    const char *path = json_str(json_obj_get(args, "path"));
+    const char *path = map_path(json_str(json_obj_get(args, "path")));
     if (!pattern[0]) return xstrdup("ERROR: pattern is required");
     if (!path[0]) path = ".";
     char *out = malloc(65536);
@@ -814,6 +881,39 @@ static char *t_battery(const jval_t *args) {
 /* ---------------- dispatch ---------------- */
 
 
+static char *t_self_build(const jval_t *args) {
+    (void)args;
+    if (!g_intern_root[0])
+        return xstrdup("ERROR: no internal tree mounted (this binary has no embedded source)");
+    char src_dir[1200], sess[1200], tmpbin[1200], cmd[8192], log[65536];
+    snprintf(src_dir, sizeof(src_dir), "%s/src", g_intern_root);
+    /* temp binary in the SESSION dir (never inside /internal, so it can't
+       get embedded at exit) */
+    snprintf(sess, sizeof(sess), "%s", g_intern_root);
+    size_t l = strlen(sess);
+    if (l > 9 && strcmp(sess + l - 9, "/internal") == 0) sess[l - 9] = 0;
+    snprintf(tmpbin, sizeof(tmpbin), "%s/selfbuild-%d", sess, (int)getpid());
+    intern_build_cmd(cmd, sizeof(cmd), src_dir, tmpbin);
+    int rc = sys_run_capture(cmd, 240, log, sizeof(log));
+    if (rc != 0) {
+        size_t ll = strlen(log);
+        const char *tail = ll > 3000 ? log + ll - 3000 : log;
+        unlink(tmpbin);
+        return fmt("ERROR: self_build failed (rc=%d):\n%s", rc, tail);
+    }
+    /* smoke-test the fresh binary */
+    char smoke[8192], s2[4096];
+    snprintf(smoke, sizeof(smoke), "%s --check-align 2>&1", tmpbin);
+    int src = sys_run_capture(smoke, 30, s2, sizeof(s2));
+    unlink(tmpbin);
+    if (src != 0) {
+        size_t ll = strlen(s2);
+        const char *tail = ll > 2000 ? s2 + ll - 2000 : s2;
+        return fmt("ERROR: self_build compiled but failed the smoke test:\n%s", tail);
+    }
+    return xstrdup("✓ self_build OK — /internal/src compiles and passes the smoke test");
+}
+
 int tool_dispatch(const char *name, const char *args_json, char **result) {
     jval_t *args = json_parse(args_json);
     if (!args) {
@@ -843,6 +943,7 @@ int tool_dispatch(const char *name, const char *args_json, char **result) {
     else if (strcmp(name, "notify") == 0) r = t_notify(args);
     else if (strcmp(name, "vibrate") == 0) r = t_vibrate(args);
     else if (strcmp(name, "battery") == 0) r = t_battery(args);
+    else if (strcmp(name, "self_build") == 0) r = t_self_build(args);
     else r = fmt("ERROR: unknown tool '%s'", name);
     json_free(args);
     if (!r) r = xstrdup("(no output)");
@@ -866,6 +967,7 @@ void tools_render_header(char *out, size_t outsz) {
         "</function>\n</tool_call>\n"
         "\n<IMPORTANT>\nReminder:\n"
         "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+        "- Call EXACTLY ONE function per message, then stop — the engine runs it and sends you the result. Wait for the result before your next call. Never chain multiple calls in one message\n"
         "- Required parameters MUST be specified\n"
         "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
         "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"

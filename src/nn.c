@@ -23,6 +23,7 @@
  */
 #include "qma.h"
 #include "kvq.h"
+#include "cl.h"
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -302,6 +303,47 @@ static void mm_worker(void *arg, int i0, int i1) {
     }
 }
 
+/* ---------------- GPU offload (OpenCL, lazy) ---------------- */
+static cl_engine_t g_cl;
+static int g_cl_state = 0;      /* 0=uninit, 1=ok, -1=failed/disabled */
+
+static void cl_maybe_init(qma_t *m) {
+    if (g_cl_state) return;
+    g_cl_state = -1;
+    if (getenv("QMA_NO_CL")) return;
+    /* memory guard: the lazy weight table grows toward ~1 GB during a
+       long prefill (plus the 20 GB streamed model + system). Refuse to
+       start the GPU when free memory is tight (this device class has
+       crashed under memory pressure). */
+    long avail_mb = -1;
+    FILE *mf = fopen("/proc/meminfo", "r");
+    if (mf) {
+        char line[128];
+        while (fgets(line, sizeof(line), mf)) {
+            if (strncmp(line, "MemAvailable:", 13) == 0) {
+                avail_mb = atol(line + 13) / 1024;
+                break;
+            }
+        }
+        fclose(mf);
+    }
+    if (avail_mb > 0 && avail_mb < 3200) {
+        fprintf(stderr, "qma: OpenCL disabled — only %ld MB free (need >3200)\n", avail_mb);
+        return;
+    }
+    if (cl_init(&g_cl, m) == 0) g_cl_state = 1;
+}
+
+/* route a T>1 Q4_K/Q6_K matmul to the GPU; returns 0 on success (else -1:
+ * caller keeps the CPU path). */
+static int cl_try_matmul(const uint8_t *w, int n_in, int n_out, int T,
+                         int wtype, const float *x, float *out) {
+    if (g_cl_state != 1 || T <= 1) return -1;
+    if (wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K) return -1;
+    if (n_in % 32 != 0) return -1;
+    return cl_matmul_qk(&g_cl, wtype, w, n_in, n_out, T, x, out);
+}
+
 /* x: [T][n_in]; W: Q4_K/Q6_K [n_in, n_out]; out: [T][n_out]
  * int8 quantized-activation SDOT dot when available (q8k), else fp32. */
 static void matmul(const float *x, const uint8_t *W, int n_in, int n_out, int T,
@@ -309,6 +351,16 @@ static void matmul(const float *x, const uint8_t *W, int n_in, int n_out, int T,
     double t0 = 0, t1 = 0;
     if (g_timing) t0 = now_s();
     (void)t1;
+    /* GPU first: prefill matmuls (T>1) on the dense projections; anything
+       the GPU declines falls through to the CPU path unchanged. */
+    if (cl_try_matmul(W, n_in, n_out, T, wtype, x, out) == 0) {
+        if (g_timing) {
+            double dt = now_s() - t0;
+            timing_add(0, dt);
+            mm_prof_add(n_in, n_out, dt * 1000.0);
+        }
+        return;
+    }
     static int q8k = -1;
     if (q8k < 0) q8k = qma_q8k_available();
     int8_t *qbuf = NULL; float *qds = NULL; int16_t *qsum = NULL;
@@ -1570,12 +1622,27 @@ static int expert_fetch(void *user, int layer, int expert, uint8_t *dst)
     const size_t gu = slab * sizeof(block_q4_K) / QK_K;
     const size_t dn = slab * (m->layers[layer].t_down_exps == GGML_TYPE_Q4_K
                                   ? sizeof(block_q4_K) : sizeof(block_q6_K)) / QK_K;
-    if (pread_all(m->fd, dst, gu, m->layers[layer].off_gate_exps + (size_t)expert * gu) != 0)
+    /* O_DIRECT path: expert bytes land straight in the pool — no page-cache
+       copy at all. Only when the fd exists AND the destination is 4K-aligned
+       (O_DIRECT requires an aligned buffer; pool slots are 16K-aligned). */
+    const int use_dio = (m->dio_fd >= 0) && (((uintptr_t)dst & 4095u) == 0);
+    const int fd = use_dio ? m->dio_fd : m->fd;
+    if (pread_all(fd, dst, gu, m->layers[layer].off_gate_exps + (size_t)expert * gu) != 0)
         return -1;
-    if (pread_all(m->fd, dst + gu, gu, m->layers[layer].off_up_exps + (size_t)expert * gu) != 0)
+    if (pread_all(fd, dst + gu, gu, m->layers[layer].off_up_exps + (size_t)expert * gu) != 0)
         return -1;
-    if (pread_all(m->fd, dst + 2 * gu, dn, m->layers[layer].off_down_exps + (size_t)expert * dn) != 0)
+    if (pread_all(fd, dst + 2 * gu, dn, m->layers[layer].off_down_exps + (size_t)expert * dn) != 0)
         return -1;
+    /* Buffered preads just populated the page cache with expert pages. The
+       ecache pool now owns these bytes and experts are NEVER read via the
+       mmap in this mode (trunk only), so drop the file-side copies: no
+       double-buffer, no cache churn evicting trunk pages. No-op if the
+       pages aren't resident; skipped entirely on the O_DIRECT path. */
+    if (!use_dio && m->map) {
+        madvise(m->map + m->layers[layer].off_gate_exps + (size_t)expert * gu, gu, MADV_DONTNEED);
+        madvise(m->map + m->layers[layer].off_up_exps   + (size_t)expert * gu, gu, MADV_DONTNEED);
+        madvise(m->map + m->layers[layer].off_down_exps + (size_t)expert * dn, dn, MADV_DONTNEED);
+    }
     return 0;
 }
 
@@ -1633,7 +1700,7 @@ int qma_defaults_enable(qma_t *m, const char *load_path)
     if (!g_def_sum) {
         g_def_sum = calloc(tot, sizeof(float));
         g_def_cnt = calloc((size_t)N_LAYER * N_EXPERT, sizeof(uint32_t));
-        if (!g_def_sum || !g_def_cnt) { free(g_def_sum); free(g_def_cnt); g_def_sum = g_def_cnt = NULL; return -1; }
+        if (!g_def_sum || !g_def_cnt) { free(g_def_sum); free(g_def_cnt); g_def_sum = NULL; g_def_cnt = NULL; return -1; }
     }
     if (load_path) {
         FILE *f = fopen(load_path, "rb");
@@ -1653,21 +1720,6 @@ int qma_defaults_enable(qma_t *m, const char *load_path)
         fclose(f);
         return -1;
     }
-    return 0;
-}
-
-int qma_defaults_save(qma_t *m, const char *path)
-{
-    (void)m;
-    if (!g_def_sum) return -1;
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
-    uint32_t magic = 0x46444e42, nl = N_LAYER, ne = N_EXPERT, nh = N_EMBD;
-    fwrite(&magic, 4, 1, f); fwrite(&nl, 4, 1, f);
-    fwrite(&ne, 4, 1, f); fwrite(&nh, 4, 1, f);
-    fwrite(g_def_cnt, 4, (size_t)N_LAYER * N_EXPERT, f);
-    fwrite(g_def_sum, 4, (size_t)N_LAYER * N_EXPERT * N_EMBD, f);
-    fclose(f);
     return 0;
 }
 
@@ -2053,16 +2105,6 @@ static void embed_row(qma_t *m, int id, float *out) {
         dequantize_row_q6_K((const block_q6_K *)row, out, N_EMBD);
 }
 
-/* ---------------- debug dump (mirrors llama-eval-callback sums) ---------- */
-static int g_dump = 0;
-static void dump_reg(const char *name, const float *x, int n) {
-    if (!g_dump) return;
-    double s = 0;
-    for (int i = 0; i < n; i++) s += x[i];
-    fprintf(stderr, "%-40s %+.6f\n", name, (float)s);
-}
-void qma_debug_enable(void) { g_dump = 1; }
-
 int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
                 float *logits, int n_threads, int prefetch, int logits_all) {
     g_pf_dist = prefetch;
@@ -2072,6 +2114,10 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
     timing_init();
     scratch_t s; scratch_alloc(rs, &s);
     const int T_MAX = MAX_CHUNK;
+
+    /* GPU offload is a prefill-only feature: arm it once when a multi-token
+       chunk is coming (decode stays on the CPU). */
+    if (n_tokens > 1) cl_maybe_init(m);
 
     int done = 0;
     while (done < n_tokens) {
@@ -2118,13 +2164,9 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
             if (g_timing) tN = now_s() - tN;
 
             if (IS_ATTN(il)) {
-                dump_reg("attn_norm", s.xn, N_EMBD * T);
                 matmul(s.xn, m->layers[il].wq, N_EMBD, WQ_DIM, T, m->layers[il].t_wq, s.qfull);
-                dump_reg("Qcur_full", s.qfull, WQ_DIM * T);
                 matmul(s.xn, m->layers[il].wk, N_EMBD, WKV_DIM, T, m->layers[il].t_wk, s.kvK);
-                dump_reg("Kcur", s.kvK, WKV_DIM * T);
                 matmul(s.xn, m->layers[il].wv, N_EMBD, WKV_DIM, T, m->layers[il].t_wv, s.kvV);
-                dump_reg("Vcur", s.kvV, WKV_DIM * T);
 
                 /* q norm on the strided Q view; copy gate to z */
                 {
@@ -2157,8 +2199,6 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
                     rope_imrope(s.kvK, N_HEAD_KV, N_EMBD_HEAD, N_EMBD_HEAD, T, pos);
                     free(pos);
                 }
-                dump_reg("Qcur_roped", s.qfull, WQ_DIM * T);
-                dump_reg("Kcur_roped", s.kvK, WKV_DIM * T);
 
                 /* attention: Q strided [T][12288], K/V [T][1024], out [T][6144] into s.z? 
                    z holds the gate — out must go elsewhere: use s.gkv region? gkv [T][18432] free here → out at offset 0. */
@@ -2172,30 +2212,18 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
                     kv_append(&ac);
                     pool_run(attn_worker, &ac, N_HEAD);
                     if (g_timing) tA = now_s() - tA;
-                    dump_reg("attn_pregate", aout, WO_DIM * T);
                     /* gate multiply (ref: attn * sigmoid(gate)) */
                     for (size_t i = 0; i < (size_t)WO_DIM * T; i++)
                         aout[i] *= 1.0f / (1.0f + expf(-s.z[i]));
-                    dump_reg("gate_sigmoid", s.z, WO_DIM * T);
-                    dump_reg("attn_gated", aout, WO_DIM * T);
                     matmul(aout, m->layers[il].wo, WO_DIM, N_EMBD, T, m->layers[il].t_wo, s.ra);
                 }
-                dump_reg("attn_output", s.ra, N_EMBD * T);
             } else {
-                dump_reg("attn_norm", s.xn, N_EMBD * T);
-                { static int tr3=-1; if (tr3<0) tr3=getenv("QMA_TRACE")!=NULL;
-                  if (tr3 && il==5) { int nn=0,ni=0; for (int i=0;i<N_EMBD*T;i++){ if(isnan(s.xn[i]))nn++; if(isinf(s.xn[i]))ni++; }
-                    fprintf(stderr,"[L5] xn nan=%d inf=%d first=%.3e\n", nn, ni, s.xn[0]); } }
                 matmul(s.xn, m->layers[il].wqkv, N_EMBD, QKV_DIM, T, m->layers[il].t_wqkv, s.qkv);
-                dump_reg("qkv_mixed", s.qkv, QKV_DIM * T);
                 matmul(s.xn, m->layers[il].attn_gate, N_EMBD, VAL_DIM, T, m->layers[il].t_gate, s.z);
-                dump_reg("z", s.z, VAL_DIM * T);
                 matmul(s.xn, m->layers[il].ssm_beta, N_EMBD, S_DT_RANK, T, m->layers[il].t_beta, s.beta);
                 for (size_t i = 0; i < (size_t)S_DT_RANK * T; i++)
                     s.beta[i] = 1.0f / (1.0f + expf(-s.beta[i]));
-                dump_reg("beta_sigmoid", s.beta, S_DT_RANK * T);
                 matmul(s.xn, m->layers[il].ssm_alpha, N_EMBD, S_DT_RANK, T, m->layers[il].t_alpha, s.gt);
-                dump_reg("alpha", s.gt, S_DT_RANK * T);
                 {
                     const float *dt = (const float *)m->layers[il].ssm_dt;
                     const float *sa = (const float *)m->layers[il].ssm_a;
@@ -2206,7 +2234,6 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
                             s.gt[(size_t)t * S_DT_RANK + h] = sp * sa[h];
                         }
                 }
-                dump_reg("gate", s.gt, S_DT_RANK * T);
                 if (g_timing) tC = now_s();
                 conv1d_layer(rs->conv_state[il], s.qkv, (const float *)m->layers[il].ssm_conv1d, s.cout, T);
                 { /* trace qkv/conv magnitudes at the failing layer */
@@ -2222,10 +2249,8 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
                                 qs, ks, vs, cs, ((const float*)m->layers[5].ssm_conv1d)[0]);
                     }
                 }
-                dump_reg("conv_output_raw", s.cout, CONV_DIM * T);
                 silu_m(s.cout, CONV_DIM, T);
                 if (g_timing) tC = now_s() - tC;
-                dump_reg("conv_output_silu", s.cout, CONV_DIM * T);
 
                 /* split+expand q/k/v (16 -> 48 heads) from channel-major cout into gkv */
                 {
@@ -2265,49 +2290,22 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
                     pool_run(gdn_worker, &gc, S_DT_RANK);
                     if (g_timing) tG = now_s() - tG;
                 }
-                dump_reg("attn_output", s.gdout, VAL_DIM * T);
                 /* gated norm: rms per head then * silu(z), in place */
                 rms_norm_head(s.gdout, (const float *)m->layers[il].ssm_norm, S_DT_RANK, T);
-                dump_reg("norm_gated", s.gdout, VAL_DIM * T);
                 {
                     for (size_t i = 0; i < (size_t)VAL_DIM * T; i++)
                         s.z[i] = s.gdout[i] * (s.z[i] / (1.0f + expf(-s.z[i])));
                 }
-                dump_reg("final_output", s.z, VAL_DIM * T);
                 matmul(s.z, m->layers[il].ssm_out, VAL_DIM, N_EMBD, T, m->layers[il].t_out, s.ra);
-                dump_reg("linear_attn_out", s.ra, N_EMBD * T);
-                if (il == 0 && getenv("QMA_DUMP_L0")) {
-                    static int dumped = 0;
-                    if (!dumped) {
-                        FILE *f = fopen(getenv("QMA_DUMP_L0"), "wb");
-                        if (f) {
-                            fwrite(s.xn, sizeof(float), N_EMBD * T, f);      /* input */
-                            fwrite(s.qkv, sizeof(float), QKV_DIM * T, f);    /* wqkv out */
-                            fwrite(s.cout, sizeof(float), CONV_DIM * T, f);  /* conv out (silu) */
-                            fwrite(s.gt, sizeof(float), S_DT_RANK * T, f);   /* gate */
-                            fwrite(s.beta, sizeof(float), S_DT_RANK * T, f); /* beta */
-                            fwrite(s.gdout, sizeof(float), VAL_DIM * T, f);  /* gdn out */
-                            fwrite(s.z, sizeof(float), VAL_DIM * T, f);      /* final (gated) */
-                            fwrite(s.ra, sizeof(float), N_EMBD * T, f);      /* ssm_out */
-                            fclose(f);
-                            fprintf(stderr, "qma: dumped layer-0 intermediates to %s\n", getenv("QMA_DUMP_L0"));
-                        }
-                        dumped = 1;
-                    }
-                }
             }
 
             /* residual + MoE FFN (256 experts top-8 + shared expert) */
             add_m(s.x2, s.ra, s.x, N_EMBD, T);
-            dump_reg("attn_residual", s.x2, N_EMBD * T);
             rms_norm_m(s.xn, s.x2, (const float *)m->layers[il].attn_post_norm, N_EMBD, T, RMS_EPS);
-            dump_reg("attn_post_norm", s.xn, N_EMBD * T);
             { double tM0 = now_s();
               moe_ffn(m, il, s.xn, s.x2, s.ra, T);
               timing_add(8, now_s() - tM0); }
-            dump_reg("ffn_out", s.ra, N_EMBD * T);
             add_m(s.x, s.ra, s.x2, N_EMBD, T);
-            dump_reg("l_out", s.x, N_EMBD * T);
             if (il == 0 && getenv("QMA_DUMP_L1")) {
                 static int dumped1 = 0;
                 if (!dumped1) {

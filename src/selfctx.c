@@ -14,8 +14,22 @@
 #include <time.h>
 #include <errno.h>
 #include "selfctx.h"
+#include "intern.h"
 
 #define PAGE 4096
+
+/* layout of the pre-self-hosting (QMASNAP2) header, for reading old snapshots */
+typedef struct {
+    char     magic[8];
+    uint64_t base_size;
+    uint64_t cfg_off, cfg_size;
+    uint64_t kv_off, kv_size;
+    uint64_t st_off, st_size;
+    uint64_t sal_off, sal_size;
+    uint64_t sysfp;
+    uint64_t n_pos;
+    uint64_t flags;
+} hdr_old_t;
 
 static uint64_t align_up(uint64_t v, uint64_t a) {
     return (v + a - 1) & ~(a - 1);
@@ -65,22 +79,55 @@ int selfctx_detect(const char *path, selfctx_hdr_t *hdr) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;
     struct stat st;
-    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(selfctx_hdr_t)) {
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)SELFCTX_HDR_LEN_OLD) {
         close(fd);
         return 0;
     }
-    selfctx_hdr_t h;
-    ssize_t n = pread(fd, &h, sizeof(h), st.st_size - (off_t)sizeof(h));
+    /* current format first (QMASNAP3, 136-byte header) */
+    if (st.st_size >= (off_t)SELFCTX_HDR_LEN_NEW) {
+        selfctx_hdr_t h;
+        ssize_t n = pread(fd, &h, sizeof(h), st.st_size - (off_t)sizeof(h));
+        if (n == (ssize_t)sizeof(h) && memcmp(h.magic, SELFCTX_MAGIC, 8) == 0) {
+            close(fd);
+            if (h.base_size == 0 || h.base_size > (uint64_t)st.st_size) return 0;
+            if (h.int_size > 0) {
+                if (h.int_off < h.base_size) return 0;
+                if (h.cfg_off > 0 && h.int_off + h.int_size > h.cfg_off) return 0;
+            } else if (h.cfg_off < h.base_size) {
+                return 0;
+            }
+            if (h.cfg_size > 0 && h.cfg_off + h.cfg_size > h.kv_off) return 0;
+            if (h.kv_size > 0 && h.kv_off + h.kv_size > (uint64_t)st.st_size) return 0;
+            if (hdr) *hdr = h;
+            return 1;
+        }
+    }
+    /* legacy format (QMASNAP2, 104-byte header): internal fields read as 0 */
+    {
+        hdr_old_t o;
+        ssize_t n = pread(fd, &o, sizeof(o), st.st_size - (off_t)sizeof(o));
+        if (n == (ssize_t)sizeof(o) && memcmp(o.magic, SELFCTX_MAGIC2, 8) == 0) {
+            close(fd);
+            if (o.base_size == 0 || o.base_size > (uint64_t)st.st_size) return 0;
+            if (o.cfg_off < o.base_size) return 0;
+            if (o.cfg_off + o.cfg_size > o.kv_off) return 0;
+            if (o.kv_off + o.kv_size > (uint64_t)st.st_size) return 0;
+            if (hdr) {
+                memset(hdr, 0, sizeof(*hdr));
+                memcpy(hdr->magic, o.magic, 8);
+                hdr->base_size = o.base_size;
+                hdr->cfg_off = o.cfg_off;  hdr->cfg_size = o.cfg_size;
+                hdr->kv_off = o.kv_off;    hdr->kv_size = o.kv_size;
+                hdr->st_off = o.st_off;    hdr->st_size = o.st_size;
+                hdr->sal_off = o.sal_off;  hdr->sal_size = o.sal_size;
+                hdr->sysfp = o.sysfp;      hdr->n_pos = o.n_pos;
+                hdr->flags = o.flags;
+            }
+            return 1;
+        }
+    }
     close(fd);
-    if (n != (ssize_t)sizeof(h)) return 0;
-    if (memcmp(h.magic, SELFCTX_MAGIC, 8) != 0) return 0;
-    /* sanity: offsets must look sane */
-    if (h.base_size == 0 || h.base_size > (uint64_t)st.st_size) return 0;
-    if (h.cfg_off < h.base_size) return 0;
-    if (h.cfg_off + h.cfg_size > h.kv_off) return 0;
-    if (h.kv_off + h.kv_size > (uint64_t)st.st_size) return 0;
-    if (hdr) *hdr = h;
-    return 1;
+    return 0;
 }
 
 int selfctx_extract(const char *path, const selfctx_hdr_t *hdr, const char *dir) {
@@ -151,19 +198,35 @@ static int is_ts_suffix(const char *s) {
     return 1;
 }
 
-char *selfctx_snapshot(const char *src, const char *dir, const char *out_dir,
-                       const char *cfg, size_t cfg_len) {
+int selfctx_append_bare(int fd, uint64_t base_size, uint64_t int_off,
+                        uint64_t int_size, uint64_t gen, uint64_t build_time) {
+    selfctx_hdr_t h;
+    memset(&h, 0, sizeof(h));
+    memcpy(h.magic, SELFCTX_MAGIC, 8);
+    h.base_size = base_size;
+    h.int_off = int_off;
+    h.int_size = int_size;
+    h.gen = gen;
+    h.build_time = build_time;
+    /* no session sections (cfg/kv/st/sal = 0) */
+    ssize_t n = write(fd, &h, sizeof(h));
+    return n == (ssize_t)sizeof(h) ? 0 : -1;
+}
+
+char *selfctx_snapshot_gen(const char *src, const char *dir, const char *out_dir,
+                           const char *cfg, size_t cfg_len,
+                           const char *intern_dir, uint64_t gen) {
     selfctx_hdr_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     memcpy(hdr.magic, SELFCTX_MAGIC, 8);
+    hdr.gen = gen;
+    hdr.build_time = (uint64_t)time(NULL);
 
     int src_fd = open(src, O_RDONLY);
     if (src_fd < 0) return NULL;
     struct stat st;
     if (fstat(src_fd, &st) != 0) { close(src_fd); return NULL; }
-    uint64_t src_size = (uint64_t)st.st_size;
-    hdr.base_size = src_size;
-    if (selfctx_detect(src, &hdr)) hdr.base_size = hdr.base_size; /* already set */
+    hdr.base_size = (uint64_t)st.st_size;
     /* if src is itself a snapshot, the base is its recorded base_size */
     {
         selfctx_hdr_t old;
@@ -183,16 +246,9 @@ char *selfctx_snapshot(const char *src, const char *dir, const char *out_dir,
     int have_st = (stat(st_path, &sst) == 0);
     int have_sal = (stat(sal_path, &ast) == 0);
 
-    /* layout: [base][pad][cfg][kv][state][salience][header] */
-    hdr.cfg_off = align_up(hdr.base_size, PAGE);
-    hdr.cfg_size = cfg ? (uint64_t)cfg_len : 0;
-    hdr.kv_off = hdr.cfg_off + hdr.cfg_size;
-    hdr.kv_size = (uint64_t)kst.st_size;
-    hdr.st_off = hdr.kv_off + hdr.kv_size;
-    hdr.st_size = have_st ? (uint64_t)sst.st_size : 0;
-    hdr.sal_off = hdr.st_off + hdr.st_size;
-    hdr.sal_size = have_sal ? (uint64_t)ast.st_size : 0;
-    uint64_t total = hdr.sal_off + hdr.sal_size + sizeof(selfctx_hdr_t);
+    /* layout: [base][internal][pad][cfg][kv][state][salience][header] */
+    hdr.int_off = align_up(hdr.base_size, PAGE);
+    /* int_size is filled after embedding (needs the blob's actual size) */
 
     /* n_pos + fp from the temp dir */
     {
@@ -202,7 +258,7 @@ char *selfctx_snapshot(const char *src, const char *dir, const char *out_dir,
         if (stat(rdy_path, &rd) == 0) hdr.flags |= SELFCTX_READY;
     }
 
-    /* output name: <base>-YYYYMMDD-HHMMSS (strip a previous suffix) */
+    /* output name: <base>-gen<N>-YYYYMMDD-HHMMSS (strip previous suffixes) */
     char name[512];
     {
         const char *slash = strrchr(src, '/');
@@ -210,22 +266,53 @@ char *selfctx_snapshot(const char *src, const char *dir, const char *out_dir,
         char clean[512];
         snprintf(clean, sizeof(clean), "%s", base);
         size_t l = strlen(clean);
-        if (l > 14 && clean[l-14] == '-' && is_ts_suffix(clean + l - 13))
-            clean[l-14] = 0;   /* running a snapshot: next one keeps the base name */
+        /* strip a -YYYYMMDD-HHMMSS tail, then a -gen<N> tail */
+        if (l > 14 && clean[l-14] == '-' && is_ts_suffix(clean + l - 13)) {
+            clean[l-14] = 0;
+            l = strlen(clean);
+            size_t d = l;
+            while (d > 0 && clean[d-1] >= '0' && clean[d-1] <= '9') d--;
+            if (d > 0 && d >= 5 && strncmp(clean + d - 5, "-gen", 4) == 0)
+                clean[d - 5] = 0;
+        }
         time_t t = time(NULL);
         struct tm tm;
         localtime_r(&t, &tm);
-        snprintf(name, sizeof(name), "%s-%04d%02d%02d-%02d%02d", clean,
+        char ts[32];
+        snprintf(ts, sizeof(ts), "%04d%02d%02d-%02d%02d",
                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+        if (gen > 0)
+            snprintf(name, sizeof(name), "%s-gen%llu-%s", clean, (unsigned long long)gen, ts);
+        else
+            snprintf(name, sizeof(name), "%s-%s", clean, ts);
     }
     char out_path[1200];
     snprintf(out_path, sizeof(out_path), "%s/%s", out_dir, name);
 
     int dst = open(out_path, O_RDWR | O_CREAT | O_TRUNC, 0755);
     if (dst < 0) { close(src_fd); return NULL; }
-    if (ftruncate(dst, (off_t)total) != 0) goto fail;
     /* base code */
     if (copy_plain_at(src_fd, 0, dst, 0, (size_t)hdr.base_size) != 0) goto fail;
+    /* pad base → int_off, then embed the internal tree */
+    if (ftruncate(dst, (off_t)hdr.int_off) != 0) goto fail;
+    if (intern_dir && intern_dir[0]) {
+        if (lseek(dst, (off_t)hdr.int_off, SEEK_SET) < 0) goto fail;
+        if (intern_embed_dir(dst, intern_dir, 0, hdr.gen, hdr.build_time) != 0) goto fail;
+        off_t end = lseek(dst, 0, SEEK_END);
+        if (end < 0) goto fail;
+        hdr.int_size = (uint64_t)(end - (off_t)hdr.int_off);
+    }
+    /* remaining sections */
+    hdr.cfg_off = align_up(hdr.int_off + hdr.int_size, PAGE);
+    hdr.cfg_size = cfg ? (uint64_t)cfg_len : 0;
+    hdr.kv_off = hdr.cfg_off + hdr.cfg_size;
+    hdr.kv_size = (uint64_t)kst.st_size;
+    hdr.st_off = hdr.kv_off + hdr.kv_size;
+    hdr.st_size = have_st ? (uint64_t)sst.st_size : 0;
+    hdr.sal_off = hdr.st_off + hdr.st_size;
+    hdr.sal_size = have_sal ? (uint64_t)ast.st_size : 0;
+    uint64_t total = hdr.sal_off + hdr.sal_size + sizeof(selfctx_hdr_t);
+    if (ftruncate(dst, (off_t)total) != 0) goto fail;
     /* model-path config blob */
     if (hdr.cfg_size > 0) {
         if (pwrite(dst, cfg, (size_t)hdr.cfg_size, (off_t)hdr.cfg_off) != (ssize_t)hdr.cfg_size)

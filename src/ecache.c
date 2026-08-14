@@ -36,9 +36,13 @@ void qma_ecache_prof_delta(const char *tag){
     extern qma_ecache *g_prof_cache;
     c = g_prof_cache;
     fprintf(stderr, "[ecprof:%s] sync=%llu(%.1fms) wait=%llu(%.1fms) hit=%llu", tag,
-            g_ec_sync_cnt-p_s, g_ec_sync_ms-p_sm, g_ec_wait_cnt-p_w, g_ec_wait_ms-p_wm, g_ec_hit_cnt-p_h);
+            (unsigned long long)(g_ec_sync_cnt-p_s), g_ec_sync_ms-p_sm,
+            (unsigned long long)(g_ec_wait_cnt-p_w), g_ec_wait_ms-p_wm,
+            (unsigned long long)(g_ec_hit_cnt-p_h));
     if (c) fprintf(stderr, " ev=%llu spec=%llu miss=%llu",
-                   c->evictions-p_ev, c->spec_issued-p_sp, c->misses);
+                   (unsigned long long)(c->evictions-p_ev),
+                   (unsigned long long)(c->spec_issued-p_sp),
+                   (unsigned long long)(c->misses));
     fprintf(stderr, "\n");
     p_s=g_ec_sync_cnt; p_sm=g_ec_sync_ms; p_w=g_ec_wait_cnt; p_wm=g_ec_wait_ms; p_h=g_ec_hit_cnt;
     if (c) { p_ev=c->evictions; p_sp=c->spec_issued; }
