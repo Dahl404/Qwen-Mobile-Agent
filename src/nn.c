@@ -282,6 +282,9 @@ static struct { int n_in, n_out; double ms; long cnt; } mm_prof[MM_BUCKETS];
 static int mm_nb = 0;
 
 static void timing_init(void) { g_timing = getenv("QMA_TIMING") != NULL; }
+void qma_timing_reset(void) {
+    for (int i = 0; i < 9; i++) { t_acc[i] = 0; t_cnt[i] = 0; }
+}
 static void timing_add(int i, double dt) { if (g_timing) { t_acc[i] += dt; t_cnt[i]++; } }
 extern void qma_ecache_prof_delta(const char *tag);
 static void timing_report(const char *tag) {
@@ -2232,10 +2235,17 @@ static void qma_predict_prefetch(qma_t *m, int il, const float *x,
         for (int e = 0; e < N_EXPERT; e++) if (sc[e] > bv) { bv = sc[e]; best = e; }
         ids[k] = best; sc[best] = -1e30f;
     }
-    /* speculative fill for the next layer: a guess, not pinned, not a miss
-       (waste ecache_prefetch — distinct from the demand hint above) */
-    if (m->ecache_on) qma_ecache_prefetch(&m->ecache, nl, ids, N_EXPERT_USED);
-    else qma_prefetch_experts(m, nl, ids, N_EXPERT_USED);
+    /* Speculative next-layer fill. Measured NET-NEGATIVE at ~54% routing
+       prediction accuracy in every implementation tried (slot claims
+       evicted good records; synchronous readahead stalled the layer).
+       Off by default; QMA_SPECPREFETCH=1 re-enables readahead warming.
+       Revisit when prediction accuracy improves (YALIS defaults load,
+       or a trained light predictor). */
+    static int spec_pf = -1;
+    if (spec_pf < 0) spec_pf = getenv("QMA_SPECPREFETCH") != NULL;
+    if (spec_pf)
+        for (int k = 0; k < N_EXPERT_USED; k++)
+            expert_readahead(m, nl, ids[k]);
     if (g_pf_trace) {
         for (int k = 0; k < N_EXPERT_USED; k++) g_pred_ids[nl][k] = ids[k];
         g_pred_gen[nl]++;

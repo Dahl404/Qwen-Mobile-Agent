@@ -47,6 +47,7 @@ int main(int argc, char **argv) {
     for (int v = 0; v < N_VOCAB; v++) if (logits[v] > logits[next]) next = v;
 
     qma_moe_timers_reset();
+    qma_timing_reset();
     t0 = now_s();
     for (int d = 0; d < ND; d++) {
         if (qma_eval(&m, &rs, &next, 1, logits, TH, 4, 0) != 0) return 1;
