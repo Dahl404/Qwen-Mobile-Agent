@@ -265,12 +265,181 @@ static float dot_q6_K_q8k(const block_q6_K *b, const int8_t *xq,
 
 /* ---- public dispatch --------------------------------------------------- */
 
+#ifdef __ARM_FEATURE_MATMUL_INT8
+
+/* i8mm GEMM core: one 64-lane group of a Q4_K super-block, one row PAIR,
+ * one token PAIR. vmmlaq_s32 computes a 2x2 tile (2 weight rows x 2 token
+ * columns) per instruction, so unlike the decode-side SDOT path every MAC
+ * slot does useful work. Requires T >= 2 for the second column to be real.
+ *
+ * Q4_K value = d*sc*q - dmin*m per 32-lane half-group; the int32 dot is
+ * accumulated raw and rescaled per group, the min bias folds through the
+ * per-16-lane activation sums (xsum) exactly like dot_q4_K_q8k. */
+static inline void q4k_group_2x2(
+    int g,
+    const uint8_t *qa, const uint8_t *qb,   /* 32 qs bytes of this group */
+    const uint8_t *sa_, const uint8_t *sb_, /* 12 scale bytes of this block */
+    float d_a, float mn_a, float d_b, float mn_b,
+    float xd_a, float xd_b,                 /* activation block scales */
+    const int16_t *spa, const int16_t *spb, /* per-16-lane sums, this block */
+    const int8_t *xa, const int8_t *xb,     /* 64 activation lanes, both toks */
+    float acc[2][2])                        /* [row][tok] fp32 running sum */
+{
+    const uint8x16_t loM = vdupq_n_u8(0x0F);
+    const uint8x16_t qa0 = vld1q_u8(qa);
+    const uint8x16_t qa1 = vld1q_u8(qa + 16);
+    const uint8x16_t qb0 = vld1q_u8(qb);
+    const uint8x16_t qb1 = vld1q_u8(qb + 16);
+    const int8x16_t ga0 = vreinterpretq_s8_u8(vandq_u8(qa0, loM));
+    const int8x16_t ga1 = vreinterpretq_s8_u8(vandq_u8(qa1, loM));
+    const int8x16_t gb0 = vreinterpretq_s8_u8(vandq_u8(qb0, loM));
+    const int8x16_t gb1 = vreinterpretq_s8_u8(vandq_u8(qb1, loM));
+    const int8x16_t ha0 = vreinterpretq_s8_u8(vshrq_n_u8(qa0, 4));
+    const int8x16_t ha1 = vreinterpretq_s8_u8(vshrq_n_u8(qa1, 4));
+    const int8x16_t hb0 = vreinterpretq_s8_u8(vshrq_n_u8(qb0, 4));
+    const int8x16_t hb1 = vreinterpretq_s8_u8(vshrq_n_u8(qb1, 4));
+
+    /* x operand pairs: [8][2] tiles are COLUMN-contiguous — B[k][j] sits
+       at byte j*8+k (probed empirically): low half = token A slice,
+       high half = token B slice. NOT an interleave/zip. */
+    const int8x16_t xa0 = vld1q_s8(xa), xa1 = vld1q_s8(xa + 16);
+    const int8x16_t xa2 = vld1q_s8(xa + 32), xa3 = vld1q_s8(xa + 48);
+    const int8x16_t xb0 = vld1q_s8(xb), xb1 = vld1q_s8(xb + 16);
+    const int8x16_t xb2 = vld1q_s8(xb + 32), xb3 = vld1q_s8(xb + 48);
+    const int8x16_t c00 = vcombine_s8(vget_low_s8(xa0), vget_low_s8(xb0));
+    const int8x16_t c01 = vcombine_s8(vget_high_s8(xa0), vget_high_s8(xb0));
+    const int8x16_t c10 = vcombine_s8(vget_low_s8(xa1), vget_low_s8(xb1));
+    const int8x16_t c11 = vcombine_s8(vget_high_s8(xa1), vget_high_s8(xb1));
+    const int8x16_t c20 = vcombine_s8(vget_low_s8(xa2), vget_low_s8(xb2));
+    const int8x16_t c21 = vcombine_s8(vget_high_s8(xa2), vget_high_s8(xb2));
+    const int8x16_t c30 = vcombine_s8(vget_low_s8(xa3), vget_low_s8(xb3));
+    const int8x16_t c31 = vcombine_s8(vget_high_s8(xa3), vget_high_s8(xb3));
+
+    /* weight row pairs: [2][8] tiles = row a slice | row b slice */
+    const int8x16_t a00 = vcombine_s8(vget_low_s8(ga0), vget_low_s8(gb0));
+    const int8x16_t a01 = vcombine_s8(vget_high_s8(ga0), vget_high_s8(gb0));
+    const int8x16_t a10 = vcombine_s8(vget_low_s8(ga1), vget_low_s8(gb1));
+    const int8x16_t a11 = vcombine_s8(vget_high_s8(ga1), vget_high_s8(gb1));
+    const int8x16_t a20 = vcombine_s8(vget_low_s8(ha0), vget_low_s8(hb0));
+    const int8x16_t a21 = vcombine_s8(vget_high_s8(ha0), vget_high_s8(hb0));
+    const int8x16_t a30 = vcombine_s8(vget_low_s8(ha1), vget_low_s8(hb1));
+    const int8x16_t a31 = vcombine_s8(vget_high_s8(ha1), vget_high_s8(hb1));
+
+    /* lanes 0..31 -> scale s1, lanes 32..63 -> scale s2 (per row) */
+    uint8_t s1a, m1a, s2a, m2a, s1b, m1b, s2b, m2b;
+    q8k_scale_min_k4(2 * g + 0, sa_, &s1a, &m1a);
+    q8k_scale_min_k4(2 * g + 1, sa_, &s2a, &m2a);
+    q8k_scale_min_k4(2 * g + 0, sb_, &s1b, &m1b);
+    q8k_scale_min_k4(2 * g + 1, sb_, &s2b, &m2b);
+
+    int32x4_t p1 = vdupq_n_s32(0), p2 = vdupq_n_s32(0);
+    p1 = vmmlaq_s32(p1, a00, c00);
+    p1 = vmmlaq_s32(p1, a01, c01);
+    p1 = vmmlaq_s32(p1, a10, c10);
+    p1 = vmmlaq_s32(p1, a11, c11);
+    p2 = vmmlaq_s32(p2, a20, c20);
+    p2 = vmmlaq_s32(p2, a21, c21);
+    p2 = vmmlaq_s32(p2, a30, c30);
+    p2 = vmmlaq_s32(p2, a31, c31);
+
+    const float d1a = d_a * s1a, mm1a = mn_a * m1a;
+    const float d2a = d_a * s2a, mm2a = mn_a * m2a;
+    const float d1b = d_b * s1b, mm1b = mn_b * m1b;
+    const float d2b = d_b * s2b, mm2b = mn_b * m2b;
+    const float ax1 = (float)(spa[0] + spa[1]), ax2 = (float)(spa[2] + spa[3]);
+    const float bx1 = (float)(spb[0] + spb[1]), bx2 = (float)(spb[2] + spb[3]);
+
+    /* coefficient matrix: rows a/b scales x tokens a/b activation scales */
+    acc[0][0] += d1a * xd_a * (float)vgetq_lane_s32(p1, 0)
+               + d2a * xd_a * (float)vgetq_lane_s32(p2, 0)
+               - (mm1a * ax1 + mm2a * ax2) * xd_a;
+    acc[1][0] += d1b * xd_a * (float)vgetq_lane_s32(p1, 2)
+               + d2b * xd_a * (float)vgetq_lane_s32(p2, 2)
+               - (mm1b * ax1 + mm2b * ax2) * xd_a;
+    acc[0][1] += d1a * xd_b * (float)vgetq_lane_s32(p1, 1)
+               + d2a * xd_b * (float)vgetq_lane_s32(p2, 1)
+               - (mm1a * bx1 + mm2a * bx2) * xd_b;
+    acc[1][1] += d1b * xd_b * (float)vgetq_lane_s32(p1, 3)
+               + d2b * xd_b * (float)vgetq_lane_s32(p2, 3)
+               - (mm1b * bx1 + mm2b * bx2) * xd_b;
+}
+/* i8mm GEMM for Q4_K x q8 activations, T >= 2 tokens at once:
+ * out[t*n_out + r] = <dequant(W row r), x_t> for rows [r0, r0+nrows),
+ * nrows even (the caller handles an odd tail row via the dot path).
+ * Token loop is outermost so an odd final token just reuses column B.
+ * ~2x instruction efficiency vs the per-row SDOT GEMV at T > 1; at
+ * T == 1 half of every vmmla tile would be wasted, so decode stays on
+ * qma_q8k_dot. */
+void qma_q8k_gemm_q4k(const uint8_t *W, size_t wrow, int r0, int nrows,
+                      const int8_t *xq, const float *xd, const int16_t *xsum,
+                      int n_in, int n_out, int T, float *out)
+{
+    const int nb = n_in / QK_K;
+    const int rend = r0 + nrows;
+
+    for (int t0 = 0; t0 < T; t0 += 2) {
+        const int t1 = (t0 + 1 < T) ? t0 + 1 : t0;
+        const int8_t *xab = xq + (size_t)t0 * n_in;
+        const int8_t *xbb = xq + (size_t)t1 * n_in;
+        const float *xda = xd + (size_t)t0 * nb;
+        const float *xdb = xd + (size_t)t1 * nb;
+        const int16_t *xsa = xsum + (size_t)t0 * (n_in / 16);
+        const int16_t *xsb = xsum + (size_t)t1 * (n_in / 16);
+
+        for (int r = r0; r + 1 < rend; r += 2) {
+            const uint8_t *wa = W + (size_t)r * wrow;
+            const uint8_t *wb = wa + wrow;
+            float s00 = 0.0f, s01 = 0.0f, s10 = 0.0f, s11 = 0.0f;
+            for (int i = 0; i < nb; i++) {
+                const block_q4_K *ba = (const block_q4_K *)wa + i;
+                const block_q4_K *bb = (const block_q4_K *)wb + i;
+                float acc[2][2] = {{0, 0}, {0, 0}};
+                const int8_t *xa = xab + (size_t)i * QK_K;
+                const int8_t *xb = xbb + (size_t)i * QK_K;
+                const int16_t *spa = xsa + (size_t)i * (QK_K / 16);
+                const int16_t *spb = xsb + (size_t)i * (QK_K / 16);
+                const float da = half_to_float(ba->d);
+                const float mna = half_to_float(ba->dmin);
+                const float db = half_to_float(bb->d);
+                const float mnb = half_to_float(bb->dmin);
+                for (int g = 0; g < 4; g++)
+                    q4k_group_2x2(g, ba->qs + g * 32, bb->qs + g * 32,
+                                  ba->scales, bb->scales,
+                                  da, mna, db, mnb,
+                                  xda[i], xdb[i], spa + g * 4, spb + g * 4,
+                                  xa + (size_t)g * 64, xb + (size_t)g * 64,
+                                  acc);
+                s00 += acc[0][0]; s01 += acc[0][1];
+                s10 += acc[1][0]; s11 += acc[1][1];
+            }
+            out[(size_t)t0 * n_out + r]     = s00;
+            out[(size_t)t0 * n_out + r + 1] = s10;
+            if (t1 != t0) {
+                out[(size_t)t1 * n_out + r]     = s01;
+                out[(size_t)t1 * n_out + r + 1] = s11;
+            }
+        }
+    }
+}
+#endif /* __ARM_FEATURE_MATMUL_INT8 */
+
 /* Quantize x (n floats, n multiple of QK_K) for the q8k path. Returns 0
  * and fills xq/xd/xsum on success; returns -1 when the CPU lacks dotprod
  * (caller falls back to the f32 dots). */
 int qma_q8k_available(void)
 {
 #if defined(__ARM_FEATURE_DOTPROD)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/* i8mm (FEAT_I8MM / SMMLA) support: enables the token-paired Q4_K GEMM
+ * used for T > 1 CPU matmuls. At decode (T == 1) SDOT remains optimal. */
+int qma_q8k_gemm_available(void)
+{
+#if defined(__ARM_FEATURE_MATMUL_INT8)
     return 1;
 #else
     return 0;

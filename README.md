@@ -51,6 +51,18 @@ into a protected slot so they survive being overwritten by newer tokens as
 long as they keep scoring well. Tokens that fall out of every tier simply
 aren't attended to. In effect, a long conversation keeps only what mattered.
 
+**Agent archive — the model's own active memory.** On top of the tiered
+cache, the agent can pin anything it wants permanent: the `memory_write` /
+`memory_append` / `memory_list` / `memory_delete` / `memory_clear` tools
+compute real K/V for the text and store it in a protected arena that
+attention reads on **every token** — immune to eviction, ring wrap, and
+restarts (entries are rebuilt from `memory.json` at boot, so the file is
+human-editable too). This is the model's own always-visible memory, not a
+file system: it never needs a tool to read it (it attends to it every step),
+and the tools only mutate it. It gives a long-running agent consolidation
+and coherence — it writes its task state and decisions down, so it never
+loses the thread when the window rolls.
+
 **Quantized KV storage.** Every key/value vector is stored in two precisions
 at once when it's written (4-bit and 2-bit), so moving a token between the
 full-precision and reduced-precision tiers is just a pointer change, not a
@@ -85,14 +97,33 @@ cores) so a long agent run doesn't throttle or overheat the device. It has
 no effect on the model's output — only on how many threads are doing the
 math at once — and logs level changes to stderr only.
 
-**One tool call per turn.** The engine never constrains the model's token
-stream (an early tool-call grammar mask backfired — when every top-k
-candidate was masked the sampler injected an illegal char and the model ran
-away emitting garbage). Instead, as soon as the model emits ONE complete
-`<tool_call>` block the engine force-ends the turn with `<|im_end|>`, runs
-that one call, folds the result back, and lets the model continue — one
-grounded, verified step at a time. Malformed calls are never executed; the
-model gets an error back and re-issues them.
+**Native Qwen tool calling.** qma uses qwen3.6's own tool-call format
+(`<tool_call><function=NAME><parameter=KEY>value</parameter></function></tool_call>`,
+per the model's chat template and the vLLM qwen3 parser). The engine never
+constrains the model's token stream (an early grammar mask backfired — when
+every top-k candidate was masked the sampler injected an illegal char and
+ran away). Reasoning follows the model's native conventions too: an
+unpaired `<tool_call>` token implicitly ends the `<think>` block, and the
+model may emit **several** complete calls in one message (its native
+multi-step behavior) — the engine runs them all and folds the results back
+as one `<tool_response>` turn. The parser is tolerant of the model's known
+format drift (dropped `<tool_call>` wrappers, improvised close tags) but
+never executes a half-typed call mid-stream; malformed calls are dropped
+and fed back as an error so the model re-issues them.
+
+**Document workers (LFM sub-agents).** qma also embeds a second, tiny
+engine — LFM2.5-2.6B (arch `lfm2`), ported from ma3 under `src/lfm/` — as
+a worker pool the main agent can delegate to. Instead of reading a whole
+file into its own context, the agent spawns a worker (`worker_spawn` with a
+path or inline text) that holds the document in its KV cache and answers
+questions about it (`worker_ask`): what line is something on, is it in
+here, summarize a section, compare several documents. The worker weights
+are loaded **once and shared**; each worker is only a KV runstate — a base
+(the worker's role prompt + document, processed once) plus **ephemeral**
+query layers on top (every question gets a clean KV on the same base) or a
+**long-term** conversation (follow-ups have context). `worker_close` frees
+one, `worker_list` shows them. The worker source lives in `/internal/src/lfm/`
+so the agent can read and modify its own sub-agents.
 
 **GPU prefill offload (OpenCL, Adreno).** The dense projections (attention
 + ssm) and the Q6_K lm head run their prefill matmuls (`T > 1`) on the GPU;
@@ -125,15 +156,21 @@ Tools available to the model: `pwd`, `ls`, `find`, `grep`, `read`, `write`,
 running qma binary physically moves to the new directory, so the next
 self-hosted generation is written into the project the agent moved to),
 `todo_write` / `todo_complete` / `todo_remove`, `write_diary` / `read_diary`,
-`ask_user`, and `self_build` (compile + smoke-test the agent's own source).
+`ask_user`, `self_build` (compile + smoke-test the agent's own source),
+`memory_write` / `memory_append` / `memory_list` / `memory_delete` /
+`memory_clear` (the agent's own always-attended KV memory), and the worker
+pool: `worker_spawn` / `worker_ask` / `worker_close` / `worker_list` (LFM
+document-analyst sub-agents).
 
 A turn works like this: the user's message is added to the running KV cache,
-the model generates a response — thinking shown dimmed, regular content shown
-normally, tool calls shown as they're emitted — and as soon as the model
-finishes ONE complete tool call, the engine ends the turn, runs that single
-call, and feeds its result back in as a `<tool_response>` before the model
-generates again. This repeats until the model responds with plain text and
-no tool call, which ends the turn.
+the model generates a response — thinking shown dimmed (the think block ends
+at `</think>` **or** at the first unpaired `<tool_call>`, per the model's
+native behavior), regular content shown normally, tool calls shown as they're
+emitted. Every complete `<tool_call>` block is parsed (several may appear in
+one message — multi-step is native); the engine runs them all and feeds the
+results back in as `<tool_response>` blocks before the model generates
+again. This repeats until the model responds with plain text and no tool
+call, which ends the turn.
 
 The agent is self-aware about its own code: `/internal/` is its internal
 filesystem (source in `/internal/src/`, version history in
@@ -214,6 +251,8 @@ These toggle debug output or opt out of a subsystem that's normally on:
 | `QMA_NOEVICT=1` | turn off tiered context memory (attend to everything instead) |
 | `QMA_NOQ8K=1` | turn off the int8 quantized-activation fast path |
 | `QMA_KVQ=0` | store the KV cache in full precision instead of quantized |
+| `QMA_WORKER_MODEL=<path>` | LFM worker model file (default `~/projects/models/lfm2.5:2.6b:Q4_K_M.gguf`) |
+| `QMA_WORKER_THREADS=<n>` | worker eval threads (default 4) |
 | `QMA_TRACE=1` | print detailed per-layer trace output |
 | `QMA_PFTRACE=1` | print prefetch trace output |
 | `QMA_ECPROF=1` | print expert-cache hit/miss statistics |
@@ -240,6 +279,10 @@ src/
   intern.c/.h          embedded internal tree: embed/extract, rebuild, version log
   thermal.c/.h         thermal governor
   json.c/.h            JSON parser/encoder
+  worker.c/.h          LFM document-worker pool (base KV + ephemeral queries)
+  lfm/                 LFM2.5-2.6B engine (namespaced port from ma3):
+    lfm.h, lfm_gguf.c, lfm_tokenizer.c, lfm_nn.c, lfm_sampler.c
+                       Q4_0/Q4_K/Q6_K matmuls, resident RAM, worker model
 ```
 
 The internal tree embedded in every binary (mounted at `/internal/`):
@@ -261,7 +304,7 @@ the source files it needs, without loading a model):
 - `tests/test_toolparse.c` — parser contract: a complete valid call parses
   to a name + JSON args; an open block returns 0 without advancing (the
   engine breaks, never spins); a complete-but-malformed block returns -1 and
-  is dropped, never executed.
+  is dropped, never executed. Streaming never auto-closes a half-typed call.
 - `tests/test_intern.c` — internal-tree blob round trip: embed a tree,
   extract it, verify every file byte-for-byte, probe the generation serial.
 - `tests/cltest.c` — GPU numerical gate: quantizes random weights to
@@ -269,6 +312,13 @@ the source files it needs, without loading a model):
   the CPU dot path — the Swiftlet-style proof that the GPU matches the CPU
   within fp16 noise (~0.1%). Prints `GPU UNAVAILABLE` and exits 0 when
   OpenCL can't start (the engine falls back to CPU in that case).
+
+There are also headless engine tests under `work/` (they load a real model,
+so they are not part of `make test`):
+- `work/test_lfm.c` — the namespaced LFM engine loads the Q4_K/Q6_K model
+  and generates sanely.
+- `work/test_worker.c` — worker pool E2E: spawn a document worker, ask
+  ephemeral questions (clean KV each), long-term follow-ups, no-tools role.
 
 The session-snapshot suite is planned.
 

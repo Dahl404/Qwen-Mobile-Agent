@@ -149,6 +149,64 @@ int main(void) {
         CHECK(strcmp(tc.args, "{\"path\":\"src/a.c\",\"old\":\"foo\",\"new\":\"bar\\nbaz\"}") == 0, "multi-param args");
     }
 
+    /* 14. MISSING </function> with prose after: streaming parse (at_end=0)
+       must NOT auto-close — the model is usually still typing </function>
+       and the old eager close executed half-drafted planning calls and
+       force-ended the turn. Only the turn-end path (at_end=1) accepts a
+       block missing its </function>. */
+    {
+        const char *txt =
+            "<function=bash>\n"
+            "<parameter=command>\n"
+            "find ~ -maxdepth 1 -type d \\( -name '*workspace*' \\) 2>/dev/null; ls .. | grep workspace 2>/dev/null || echo \"not in parent\" && find /data/data/com.termux/files/home/ -maxdepth 1 -type d | grep workspace\n"
+            "</parameter>\n"
+            "<parameter=timeout>\n"
+            "10\n"
+            "</parameter>\n"
+            "I need to use a simpler approach.";
+        const char *p = strstr(txt, "<function=");
+        int r = parse_one_tool_call(txt, &p, &tc);
+        CHECK(r == 0, "streaming: no auto-close on prose after last </parameter> (0)");
+        p = strstr(txt, "<function=");
+        r = parse_one_tool_call_full(txt, &p, &tc, 1);
+        CHECK(r == 1, "turn end: auto-closes -> 1");
+        CHECK(strcmp(tc.name, "bash") == 0, "name == bash");
+        CHECK(strstr(tc.args, "\"timeout\":10") != NULL, "timeout param kept");
+        CHECK(strstr(tc.args, "workspace") != NULL, "command value kept");
+    }
+
+    /* 15. MISSING </function> with NOTHING after (turn ends): streaming
+       must WAIT (the model may still write more), but at_end=1 must close. */
+    {
+        const char *txt =
+            "<function=bash>\n"
+            "<parameter=command>\n"
+            "ls -la\n"
+            "</parameter>\n"
+            "<parameter=timeout>\n"
+            "10\n"
+            "</parameter>";
+        const char *p = strstr(txt, "<function=");
+        int r = parse_one_tool_call(txt, &p, &tc);
+        CHECK(r == 0, "nothing after last </parameter>: streaming waits (0)");
+        r = parse_one_tool_call_full(txt, &p, &tc, 1);
+        CHECK(r == 1, "turn end (at_end=1): auto-closes -> 1");
+        CHECK(strcmp(tc.args, "{\"command\":\"ls -la\",\"timeout\":10}") == 0, "auto-closed args");
+    }
+
+    /* 16. MISSING </function> but a SECOND call follows: the auto-close
+       region must stop at the next <function= so the second call's
+       parameters don't leak into the first. */
+    {
+        const char *txt =
+            "<function=ls><parameter=path>src</parameter>"
+            "<function=read><parameter=path>a.c</parameter>";
+        const char *p = strstr(txt, "<function=");
+        int r = parse_one_tool_call_full(txt, &p, &tc, 1);
+        CHECK(r == 1 && strcmp(tc.name, "ls") == 0, "auto-close stops at next block");
+        CHECK(strcmp(tc.args, "{\"path\":\"src\"}") == 0, "first call's args only");
+    }
+
     printf(n_fail == 0 ? "PASS: toolparse contract\n" : "FAIL: %d check(s) failed\n", n_fail);
     return n_fail == 0 ? 0 : 1;
 }

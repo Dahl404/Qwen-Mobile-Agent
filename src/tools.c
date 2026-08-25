@@ -19,6 +19,7 @@
 #include "tools.h"
 #include "json.h"
 #include "intern.h"
+#include "worker.h"
 
 /* ---------------- schemas ---------------- */
 
@@ -92,101 +93,194 @@ const tool_schema_t g_tools[] = {
     {"self_build",
      "Compile the internal source tree (/internal/src) with the same flags as the Makefile and smoke-test the result. Call after editing your own code to verify it before qma commits it at exit.",
      "{\"type\":\"object\",\"properties\":{}}"},
+    {"memory_write",
+     "Write (create or replace) a long-term memory entry. Memory is pinned into your KV cache and attended on EVERY token forever — it survives the rolling window and restarts. Use it for consolidation: save the user's goal, your plan, decisions, and facts you must not forget. Returns the token count pinned.",
+     "{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"key\",\"content\"]}"},
+    {"memory_append",
+     "Append text to an existing memory entry (or create it). Use after each step of a multi-step task to record progress: what you did and what's next.",
+     "{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"key\",\"content\"]}"},
+    {"memory_list",
+     "List all memory entry keys with their token counts.",
+     "{\"type\":\"object\",\"properties\":{}}"},
+    {"memory_delete",
+     "Delete a memory entry and free its pinned KV slots.",
+     "{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"]}"},
+    {"memory_clear",
+     "Delete ALL memory entries (frees the whole pinned archive).",
+     "{\"type\":\"object\",\"properties\":{}}"},
+    {"worker_spawn",
+     "Spawn an LFM document-analyst worker. Give it a document (path preferred — the worker reads the file itself; or doc for inline text). The worker holds the document in its KV cache and answers questions about it. Returns a worker id.",
+     "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"doc\":{\"type\":\"string\"},\"role\":{\"type\":\"string\"}}}"},
+    {"worker_ask",
+     "Ask a spawned worker a question about its document. ephemeral=true (default) gives a clean KV per query — the worker forgets the question after answering, so every question sees the same fresh document. ephemeral=false keeps the conversation (follow-up questions work). Returns the worker's answer.",
+     "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"question\":{\"type\":\"string\"},\"ephemeral\":{\"type\":\"boolean\",\"default\":true},\"max_tokens\":{\"type\":\"integer\",\"default\":0}},\"required\":[\"id\",\"question\"]}"},
+    {"worker_close",
+     "Close a worker and free its KV cache.",
+     "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"required\":[\"id\"]}"},
+    {"worker_list",
+     "List active workers with their ids.",
+     "{\"type\":\"object\",\"properties\":{}}"},
 };
 
 const int g_n_tools = (int)(sizeof(g_tools) / sizeof(g_tools[0]));
 
-/* ---------------- helpers ---------------- */
+/* ---------------- safe helpers ---------------- */
 
-static char *xstrdup(const char *s) {
-    char *p = strdup(s ? s : "");
-    return p;
+char *xstrdup(const char *s) {
+    return strdup(s ? s : "");
 }
 
-static char *fmt(const char *fmt, ...) {
-    va_list ap;
-    char buf[8192];
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    return xstrdup(buf);
-}
-
-#include <stdarg.h>
-
-/* path guard: returns NULL if ok, else a heap error string */
-static char *path_guard(const char *path) {
-    if (!path || !path[0])
-        return fmt("ERROR: path is REQUIRED and must be a file path, never empty. Use list_directory to see existing dirs.");
-    if (path[strlen(path)-1] == '/')
-        return fmt("ERROR: '%s' is a directory. path must be a file path (e.g. 'main.c' or 'src/main.c').", path);
-    struct stat st;
-    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
-        return fmt("ERROR: '%s' is a directory. path must be a file path (e.g. 'main.c' or 'src/main.c').", path);
-    return NULL;
-}
-
-static char *read_whole_file(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return fmt("ERROR: cannot open '%s': %s", path, strerror(errno));
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz < 0) { fclose(f); return fmt("ERROR: cannot read '%s'", path); }
-    char *buf = malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return fmt("ERROR: OOM reading '%s'", path); }
-    size_t rd = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    buf[rd] = 0;
+/* Safe dynamic formatting (uses vasprintf, falls back to snprintf) */
+static char *fmt_v(const char *fmt, va_list ap) {
+    char *buf = NULL;
+    int len = vasprintf(&buf, fmt, ap);
+    if (len < 0) return xstrdup("(formatting error)");
     return buf;
 }
 
-/* ---------------- tool implementations ---------------- */
+char *fmt(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char *r = fmt_v(fmt, ap);
+    va_end(ap);
+    return r;
+}
 
+/* Expand leading ~/ and ~user/ to home directory using getpwnam if needed.
+   Returns a newly allocated string (caller must free). */
+static char *path_expand_home_alloc(const char *p) {
+    if (!p || !p[0]) return xstrdup(p);
+    if (p[0] != '~') return xstrdup(p);
+    const char *slash = strchr(p, '/');
+    const char *user = NULL;
+    size_t user_len = 0;
+    if (slash && slash > p + 1) {
+        user = p + 1;
+        user_len = (size_t)(slash - user);
+    } else if (!slash && p[1] != '\0') {
+        user = p + 1;
+        user_len = strlen(user);
+    }
+    const char *home = NULL;
+    if (user_len > 0) {
+        char *uname = malloc(user_len + 1);
+        if (!uname) return xstrdup(p);
+        memcpy(uname, user, user_len);
+        uname[user_len] = 0;
+        struct passwd *pw = getpwnam(uname);
+        free(uname);
+        if (pw) home = pw->pw_dir;
+    } else {
+        home = getenv("HOME");
+    }
+    if (!home) home = "/";
+    if (!slash) return fmt("%s", home);
+    return fmt("%s%s", home, slash);
+}
 
-/* ---- internal filesystem mapping ----
+/* Path guard: returns NULL if ok, else heap error string */
+static char *path_guard(const char *path) {
+    char *ep = path_expand_home_alloc(path);
+    if (!ep || !ep[0]) {
+        free(ep);
+        return fmt("ERROR: path is REQUIRED and must be a file path, never empty.");
+    }
+    if (ep[strlen(ep)-1] == '/') {
+        free(ep);
+        return fmt("ERROR: '%s' is a directory. path must be a file path.", ep);
+    }
+    struct stat st;
+    if (stat(ep, &st) == 0 && S_ISDIR(st.st_mode)) {
+        free(ep);
+        return fmt("ERROR: '%s' is a directory. path must be a file path.", ep);
+    }
+    free(ep);
+    return NULL;
+}
+
+char *read_whole_file(const char *path) {
+    fprintf(stderr, "[TRACE] read_whole_file: enter, path=%p\n", (void*)path); fflush(stderr);
+    char *ep = path_expand_home_alloc(path);
+    fprintf(stderr, "[TRACE] read_whole_file: expanded ep=%s\n", ep ? ep : "(null)"); fflush(stderr);
+    if (!ep) return fmt("ERROR: invalid path");
+    FILE *f = fopen(ep, "rb");
+    fprintf(stderr, "[TRACE] read_whole_file: fopen -> %p\n", (void*)f); fflush(stderr);
+    if (!f) {
+        char *err = fmt("ERROR: cannot open '%s': %s", ep, strerror(errno));
+        free(ep);
+        return err;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    fprintf(stderr, "[TRACE] read_whole_file: sz=%ld\n", sz); fflush(stderr);
+    if (sz < 0) {
+        fclose(f);
+        free(ep);
+        return fmt("ERROR: cannot read '%s'", ep);
+    }
+    char *buf = malloc((size_t)sz + 1);
+    fprintf(stderr, "[TRACE] read_whole_file: malloc(%ld+1) -> %p\n", sz, (void*)buf); fflush(stderr);
+    if (!buf) {
+        fclose(f);
+        free(ep);
+        return fmt("ERROR: OOM reading '%s'", ep);
+    }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    fprintf(stderr, "[TRACE] read_whole_file: fread -> rd=%zu\n", rd); fflush(stderr);
+    fclose(f);
+    free(ep);
+    buf[rd] = 0;
+    fprintf(stderr, "[TRACE] read_whole_file: returning buf=%p, len=%zu\n", (void*)buf, strlen(buf)); fflush(stderr);
+    return buf;
+}
+
+/* ---------------- internal filesystem mapping ----
    The agent's internal tree (its own source + collected tools/data) lives
    at $QMA_INTERNAL, extracted from the binary at boot. Structured tools
    accept the logical path /internal/... and we rewrite it to the real
    location; bash uses the $QMA_INTERNAL env var instead. */
-static char g_intern_root[4096] = "";
+static char *g_intern_root = NULL;
 void intern_set_root(const char *root) {
-    snprintf(g_intern_root, sizeof(g_intern_root), "%s", root);
+    free(g_intern_root);
+    g_intern_root = root ? strdup(root) : NULL;
 }
 
-/* running binary path — shared with agent.c (which resolves it at boot and
-   writes the next-generation snapshot into its directory at exit). t_enter
-   renames the binary to the new cwd and updates this so the lineage follows
-   the agent; finish_session() in agent.c reads the same variable. */
+/* running binary path — shared with agent.c */
 extern char g_self_exe[1024];
 
-static char g_map_buf[4096];
-/* rewrite "/internal/..." / "internal/..." to <root>/...; otherwise as-is */
-static const char *map_path(const char *p) {
+/* map_path returns a newly allocated string (caller must free) */
+static char *map_path_alloc(const char *p) {
+    if (!p || !g_intern_root) return xstrdup(p);
     const char *rest = NULL;
-    if (!g_intern_root[0] || !p) return p;
     if (strncmp(p, "/internal/", 10) == 0)    rest = p + 10;
     else if (strcmp(p, "/internal") == 0)     rest = "";
     else if (strncmp(p, "internal/", 9) == 0) rest = p + 9;
     else if (strcmp(p, "internal") == 0)      rest = "";
-    if (!rest) return p;
-    snprintf(g_map_buf, sizeof(g_map_buf), "%s/%s", g_intern_root, rest);
-    return g_map_buf;
+    if (rest) return fmt("%s/%s", g_intern_root, rest);
+    return xstrdup(p);
 }
+
+/* ---- tool implementations ---- */
 
 static char *t_pwd(void) {
     char buf[4096];
     if (!getcwd(buf, sizeof(buf))) return fmt("ERROR: getcwd: %s", strerror(errno));
-    return fmt("%s", buf);
+    return xstrdup(buf);
 }
 
 static char *t_list_dir(const jval_t *args) {
-    const char *path = map_path(json_str(json_obj_get(args, "path")));
-    if (!path[0]) path = ".";
+    const char *path_raw = json_str(json_obj_get(args, "path"));
+    char *path = map_path_alloc(path_expand_home_alloc(path_raw));
+    if (!path[0]) { free(path); path = xstrdup("."); }
     int hidden = json_bool(json_obj_get(args, "show_hidden"));
     int lng = json_bool(json_obj_get(args, "long_format"));
     DIR *d = opendir(path);
-    if (!d) return fmt("ERROR: cannot open '%s': %s", path, strerror(errno));
+    if (!d) {
+        char *err = fmt("ERROR: cannot open '%s': %s", path, strerror(errno));
+        free(path);
+        return err;
+    }
     char *out = malloc(65536);
     size_t o = 0;
     out[0] = 0;
@@ -214,111 +308,187 @@ static char *t_list_dir(const jval_t *args) {
         }
     }
     closedir(d);
+    free(path);
     return out;
 }
 
 static char *t_search(const jval_t *args) {
     const char *pattern = json_str(json_obj_get(args, "pattern"));
-    const char *path = map_path(json_str(json_obj_get(args, "path")));
+    const char *path_raw = json_str(json_obj_get(args, "path"));
+    char *path = map_path_alloc(path_expand_home_alloc(path_raw));
     int recursive = json_bool(json_obj_get(args, "recursive"));
-    if (!pattern[0]) return fmt("ERROR: pattern is required");
-    if (!path[0]) path = ".";
-    /* grep -rn (or -n for single file/dir) */
+    if (!pattern[0]) { free(path); return fmt("ERROR: pattern is required"); }
+    if (!path[0]) { free(path); path = xstrdup("."); }
     char cmd[8192];
-    /* simple shell-quote the pattern and path */
     char qpat[2048], qpath[2048];
     snprintf(qpat, sizeof(qpat), "'%s'", pattern);
     snprintf(qpath, sizeof(qpath), "'%s'", path);
     snprintf(cmd, sizeof(cmd), "grep -n %s %s %s 2>&1 | head -200",
              recursive ? "-r" : "", qpat, qpath);
     FILE *f = popen(cmd, "r");
-    if (!f) return fmt("ERROR: grep failed");
+    if (!f) { free(path); return fmt("ERROR: grep failed"); }
     char *out = malloc(65536);
     size_t o = 0;
     out[0] = 0;
     char line[2048];
     while (fgets(line, sizeof(line), f)) {
-        if (o + strlen(line) + 1 < 65536) { strcpy(out + o, line); o += strlen(line); }
+        if (o + strlen(line) + 1 < 65536) {
+            strcpy(out + o, line);
+            o += strlen(line);
+        }
     }
     pclose(f);
+    free(path);
     if (o == 0) { free(out); return xstrdup("no matches"); }
     return out;
 }
 
+#define LARGE_FILE_THRESHOLD 2000   // estimated tokens
+
 static char *t_read_file(const jval_t *args) {
-    const char *path = map_path(json_str(json_obj_get(args, "path")));
+    fprintf(stderr, "[TRACE] t_read_file: enter\n"); fflush(stderr);
+    const char *path = json_str(json_obj_get(args, "path"));
+    fprintf(stderr, "[TRACE] t_read_file: path='%s'\n", path ? path : "(null)"); fflush(stderr);
     int start = (int)json_num(json_obj_get(args, "start_line"));
     int maxl = (int)json_num(json_obj_get(args, "max_lines"));
     char *err = path_guard(path);
+    fprintf(stderr, "[TRACE] t_read_file: path_guard -> %s\n", err ? "ERROR" : "ok"); fflush(stderr);
     if (err) return err;
+    char *ep = path_expand_home_alloc(path);
+    fprintf(stderr, "[TRACE] t_read_file: ep='%s'\n", ep ? ep : "(null)"); fflush(stderr);
     if (start < 1) start = 1;
     if (maxl <= 0) maxl = 500;
-    char *content = read_whole_file(path);
-    if (!content || strncmp(content, "ERROR:", 6) == 0) return content ? content : xstrdup("ERROR: read failed");
-    /* split lines, render with numbers */
-    char *out = malloc(262144);
-    size_t o = 0;
-    out[0] = 0;
+
+    char *content = read_whole_file(ep);
+    fprintf(stderr, "[TRACE] t_read_file: read_whole_file returned %p\n", (void*)content); fflush(stderr);
+    free(ep);
+    if (!content || strncmp(content, "ERROR:", 6) == 0) {
+        fprintf(stderr, "[TRACE] t_read_file: content error path\n"); fflush(stderr);
+        return content ? content : xstrdup("ERROR: read failed");
+    }
+
+    size_t len = strlen(content);
+    int est_tokens = (int)(len / 4);
+    fprintf(stderr, "[TRACE] t_read_file: len=%zu est_tokens=%d\n", len, est_tokens); fflush(stderr);
+
+    // If file is large AND not a specific range, show preview + worker suggestion
+    if (est_tokens > LARGE_FILE_THRESHOLD && start == 1 && maxl >= 500) {
+        fprintf(stderr, "[TRACE] t_read_file: entering PREVIEW branch\n"); fflush(stderr);
+        char *out = malloc(16384);
+        fprintf(stderr, "[TRACE] t_read_file: preview malloc -> %p\n", (void*)out); fflush(stderr);
+        size_t o = 0;
+        out[0] = 0;
+        int line = 1;
+        char *save = NULL;
+        char *tok = strtok_r(content, "\n", &save);
+        while (tok && line <= 50) {
+            int w = snprintf(out + o, 16384 - o, "%6d\t%s\n", line, tok);
+            if (w < 0 || (size_t)w >= 16384 - o) break;   // would overflow out[]; stop the preview here
+            o += (size_t)w;
+            line++;
+            tok = strtok_r(NULL, "\n", &save);
+        }
+        fprintf(stderr, "[TRACE] t_read_file: preview loop done, o=%zu line=%d\n", o, line); fflush(stderr);
+        free(content);
+        snprintf(out + o, 16384 - o,
+                 "\n... file has ~%d tokens (full content not shown). "
+                 "Use worker_spawn(path=\"%s\") then worker_ask(id, \"...\") to "
+                 "analyse it without loading it into your own context.\n",
+                 est_tokens, path);
+        fprintf(stderr, "[TRACE] t_read_file: preview branch returning\n"); fflush(stderr);
+        return out;
+    }
+    fprintf(stderr, "[TRACE] t_read_file: entering FULL branch\n"); fflush(stderr);
+
+    // Full content with line numbers using dynamic buffer
+    char *out = NULL;
+    size_t out_cap = 0, out_len = 0;
     int line = 1;
     char *save = NULL;
     char *tok = strtok_r(content, "\n", &save);
     while (tok) {
         if (line > start - 1 + maxl) break;
         if (line >= start) {
-            int w = snprintf(out + o, 262144 - o, "%6d\t%s\n", line, tok);
-            if (w > 0) o += (size_t)w;
+            int need = snprintf(NULL, 0, "%6d\t%s\n", line, tok);
+            if (need < 0) { free(content); free(out); return xstrdup("ERROR: formatting failed"); }
+            if (out_len + (size_t)need + 1 > out_cap) {
+                size_t new_cap = out_cap ? out_cap * 2 : 16384;
+                while (new_cap < out_len + (size_t)need + 1) new_cap *= 2;
+                char *new_out = realloc(out, new_cap);
+                if (!new_out) { free(content); free(out); return xstrdup("ERROR: OOM"); }
+                out = new_out;
+                out_cap = new_cap;
+            }
+            int w = snprintf(out + out_len, out_cap - out_len, "%6d\t%s\n", line, tok);
+            if (w > 0) out_len += (size_t)w;
         }
         line++;
         tok = strtok_r(NULL, "\n", &save);
     }
+    fprintf(stderr, "[TRACE] t_read_file: full loop done, out_len=%zu\n", out_len); fflush(stderr);
     free(content);
+    if (!out) { out = xstrdup(""); out_len = 0; } else out[out_len] = 0;
+    fprintf(stderr, "[TRACE] t_read_file: full branch returning\n"); fflush(stderr);
     return out;
 }
 
 static char *t_write_file(const jval_t *args) {
-    const char *path = map_path(json_str(json_obj_get(args, "path")));
+    const char *path = json_str(json_obj_get(args, "path"));
     const char *content = json_str(json_obj_get(args, "content"));
     char *err = path_guard(path);
     if (err) return err;
-    /* create parent dirs */
+    char *ep = path_expand_home_alloc(path);
+    if (!content || !content[0]) {
+        free(ep);
+        return xstrdup("ERROR: content is empty — nothing was written. write() requires a non-empty content string.");
+    }
     char copy[4096];
-    snprintf(copy, sizeof(copy), "%s", path);
+    snprintf(copy, sizeof(copy), "%s", ep);
     for (char *p = copy; (p = strchr(p, '/')) != NULL; p++) {
         *p = 0;
         if (copy[0]) mkdir(copy, 0755);
         *p = '/';
     }
-    FILE *f = fopen(path, "w");
-    if (!f) return fmt("ERROR: cannot write '%s': %s", path, strerror(errno));
+    FILE *f = fopen(ep, "w");
+    if (!f) {
+        char *err2 = fmt("ERROR: cannot write '%s': %s", ep, strerror(errno));
+        free(ep);
+        return err2;
+    }
     fwrite(content, 1, strlen(content), f);
     fclose(f);
+    free(ep);
     return fmt("✓ wrote %zu bytes to %s", strlen(content), path);
 }
 
 static char *t_edit(const jval_t *args) {
-    const char *path = map_path(json_str(json_obj_get(args, "path")));
+    const char *path = json_str(json_obj_get(args, "path"));
     char *err = path_guard(path);
     if (err) return err;
+    char *ep = path_expand_home_alloc(path);
     const jval_t *edits = json_obj_get(args, "edits");
-    if (!edits || edits->type != J_ARR || edits->n == 0)
+    if (!edits || edits->type != J_ARR || edits->n == 0) {
+        free(ep);
         return xstrdup("ERROR: edit requires an edits array of {oldText,newText} pairs");
-    char *content = read_whole_file(path);
-    if (!content || strncmp(content, "ERROR:", 6) == 0) return content ? content : xstrdup("ERROR: read failed");
+    }
+    char *content = read_whole_file(ep);
+    if (!content || strncmp(content, "ERROR:", 6) == 0) {
+        free(ep);
+        return content ? content : xstrdup("ERROR: read failed");
+    }
     char *cur = content;
     for (size_t i = 0; i < edits->n; i++) {
         const jval_t *pr = json_arr_get(edits, i);
-        if (!pr || pr->type != J_OBJ) { free(content); return fmt("ERROR: edits[%zu] is not an object", i); }
+        if (!pr || pr->type != J_OBJ) { free(content); free(ep); return fmt("ERROR: edits[%zu] is not an object", i); }
         const char *oldT = json_str(json_obj_get(pr, "oldText"));
         const char *newT = json_str(json_obj_get(pr, "newText"));
-        if (!oldT[0]) { free(content); return fmt("ERROR: edits[%zu] oldText is empty", i); }
-        /* count occurrences */
+        if (!oldT[0]) { free(content); free(ep); return fmt("ERROR: edits[%zu] oldText is empty", i); }
         int count = 0;
         for (const char *p = cur; (p = strstr(p, oldT)) != NULL; p += strlen(oldT)) count++;
-        if (count != 1) { free(content); return fmt("ERROR: oldText must match exactly once (found %d): %.80s", count, oldT); }
-        /* replace */
+        if (count != 1) { free(content); free(ep); return fmt("ERROR: oldText must match exactly once (found %d): %.80s", count, oldT); }
         size_t cl = strlen(cur), ol = strlen(oldT), nl = strlen(newT);
         char *next = malloc(cl - ol + nl + 1);
-        if (!next) { free(content); return fmt("ERROR: OOM"); }
+        if (!next) { free(content); free(ep); return fmt("ERROR: OOM"); }
         char *hit = strstr(cur, oldT);
         size_t pre = (size_t)(hit - cur);
         memcpy(next, cur, pre);
@@ -327,16 +497,19 @@ static char *t_edit(const jval_t *args) {
         free(cur);
         cur = next;
     }
-    FILE *f = fopen(path, "w");
-    if (!f) { free(content); free(cur); return fmt("ERROR: cannot write '%s': %s", path, strerror(errno)); }
+    FILE *f = fopen(ep, "w");
+    if (!f) {
+        free(content); free(cur); free(ep);
+        return fmt("ERROR: cannot write '%s': %s", ep, strerror(errno));
+    }
     fwrite(cur, 1, strlen(cur), f);
     fclose(f);
     size_t n = strlen(cur);
-    free(cur); free(content);
+    free(cur); free(content); free(ep);
     return fmt("✓ edited %s (%zu bytes)", path, n);
 }
 
-/* line-range helpers: split content into lines array */
+/* line-range helpers */
 typedef struct { char **lines; int n; int cap; } lines_t;
 static void lines_free(lines_t *ls) {
     for (int i = 0; i < ls->n; i++) free(ls->lines[i]);
@@ -379,25 +552,30 @@ static char *lines_join(lines_t *ls) {
 }
 
 static char *t_replace_lines(const jval_t *args) {
-    const char *path = map_path(json_str(json_obj_get(args, "path")));
+    const char *path = json_str(json_obj_get(args, "path"));
     int s = (int)json_num(json_obj_get(args, "start_line"));
     int e = (int)json_num(json_obj_get(args, "end_line"));
     const char *nc = json_str(json_obj_get(args, "new_content"));
     char *err = path_guard(path);
     if (err) return err;
-    char *content = read_whole_file(path);
-    if (!content || strncmp(content, "ERROR:", 6) == 0) return content ? content : xstrdup("ERROR: read failed");
+    char *ep = path_expand_home_alloc(path);
+    char *content = read_whole_file(ep);
+    if (!content || strncmp(content, "ERROR:", 6) == 0) {
+        free(ep);
+        return content ? content : xstrdup("ERROR: read failed");
+    }
     lines_t ls;
-    if (lines_split(&ls, content) != 0) { free(content); return xstrdup("ERROR: OOM"); }
-    if (s < 1 || e > ls.n || e < s) { lines_free(&ls); free(content); return fmt("ERROR: bad range %d-%d (file has %d lines)", s, e, ls.n); }
-    /* build new lines: 1..s-1, new_content lines, e+1..n */
+    if (lines_split(&ls, content) != 0) { free(content); free(ep); return xstrdup("ERROR: OOM"); }
+    if (s < 1 || e > ls.n || e < s) {
+        lines_free(&ls); free(content); free(ep);
+        return fmt("ERROR: bad range %d-%d (file has %d lines)", s, e, ls.n);
+    }
     int nl = 1;
     const char *p = nc;
     while (*p) { if (*p == '\n') nl++; p++; }
     char **newlines = malloc((size_t)(ls.n - (e - s + 1) + nl) * sizeof(char *));
     int k = 0;
     for (int i = 0; i < s - 1; i++) newlines[k++] = ls.lines[i];
-    /* split new_content */
     {
         char tmp[65536];
         snprintf(tmp, sizeof(tmp), "%s", nc);
@@ -406,32 +584,39 @@ static char *t_replace_lines(const jval_t *args) {
             newlines[k] = xstrdup(t);
             k++;
         }
-        if (k == 0 || (k == 1 && !newlines[0][0])) { /* empty content */ }
     }
     for (int i = e; i < ls.n; i++) newlines[k++] = ls.lines[i];
-    /* rebuild */
     lines_t nl2 = { newlines, k, k };
     char *out = lines_join(&nl2);
-    FILE *f = fopen(path, "w");
-    if (!f) { free(out); lines_free(&ls); free(content); return fmt("ERROR: cannot write '%s': %s", path, strerror(errno)); }
+    FILE *f = fopen(ep, "w");
+    if (!f) {
+        free(out); free(newlines); lines_free(&ls); free(content); free(ep);
+        return fmt("ERROR: cannot write '%s': %s", ep, strerror(errno));
+    }
     fwrite(out, 1, strlen(out), f);
     fclose(f);
-    free(out); free(newlines); lines_free(&ls); free(content);
+    free(out); free(newlines); lines_free(&ls); free(content); free(ep);
     return fmt("✓ replaced lines %d-%d in %s", s, e, path);
 }
 
 static char *t_insert_lines(const jval_t *args) {
-    const char *path = map_path(json_str(json_obj_get(args, "path")));
+    const char *path = json_str(json_obj_get(args, "path"));
     int after = (int)json_num(json_obj_get(args, "after_line"));
     const char *content = json_str(json_obj_get(args, "content"));
     char *err = path_guard(path);
     if (err) return err;
-    char *file = read_whole_file(path);
-    if (!file || strncmp(file, "ERROR:", 6) == 0) return file ? file : xstrdup("ERROR: read failed");
+    char *ep = path_expand_home_alloc(path);
+    char *file = read_whole_file(ep);
+    if (!file || strncmp(file, "ERROR:", 6) == 0) {
+        free(ep);
+        return file ? file : xstrdup("ERROR: read failed");
+    }
     lines_t ls;
-    if (lines_split(&ls, file) != 0) { free(file); return xstrdup("ERROR: OOM"); }
-    if (after < 0 || after > ls.n) { lines_free(&ls); free(file); return fmt("ERROR: after_line %d out of range (file has %d lines)", after, ls.n); }
-    /* build */
+    if (lines_split(&ls, file) != 0) { free(file); free(ep); return xstrdup("ERROR: OOM"); }
+    if (after < 0 || after > ls.n) {
+        lines_free(&ls); free(file); free(ep);
+        return fmt("ERROR: after_line %d out of range (file has %d lines)", after, ls.n);
+    }
     int nl = 1;
     const char *p = content;
     while (*p) { if (*p == '\n') nl++; p++; }
@@ -450,25 +635,35 @@ static char *t_insert_lines(const jval_t *args) {
     for (int i = after; i < ls.n; i++) newlines[k++] = ls.lines[i];
     lines_t nl2 = { newlines, k, k };
     char *out = lines_join(&nl2);
-    FILE *f = fopen(path, "w");
-    if (!f) { free(out); free(newlines); lines_free(&ls); free(file); return fmt("ERROR: cannot write '%s': %s", path, strerror(errno)); }
+    FILE *f = fopen(ep, "w");
+    if (!f) {
+        free(out); free(newlines); lines_free(&ls); free(file); free(ep);
+        return fmt("ERROR: cannot write '%s': %s", ep, strerror(errno));
+    }
     fwrite(out, 1, strlen(out), f);
     fclose(f);
-    free(out); free(newlines); lines_free(&ls); free(file);
+    free(out); free(newlines); lines_free(&ls); free(file); free(ep);
     return fmt("✓ inserted %d lines after line %d in %s", nl, after, path);
 }
 
 static char *t_delete_lines(const jval_t *args) {
-    const char *path = map_path(json_str(json_obj_get(args, "path")));
+    const char *path = json_str(json_obj_get(args, "path"));
     int s = (int)json_num(json_obj_get(args, "start_line"));
     int e = (int)json_num(json_obj_get(args, "end_line"));
     char *err = path_guard(path);
     if (err) return err;
-    char *file = read_whole_file(path);
-    if (!file || strncmp(file, "ERROR:", 6) == 0) return file ? file : xstrdup("ERROR: read failed");
+    char *ep = path_expand_home_alloc(path);
+    char *file = read_whole_file(ep);
+    if (!file || strncmp(file, "ERROR:", 6) == 0) {
+        free(ep);
+        return file ? file : xstrdup("ERROR: read failed");
+    }
     lines_t ls;
-    if (lines_split(&ls, file) != 0) { free(file); return xstrdup("ERROR: OOM"); }
-    if (s < 1 || e > ls.n || e < s) { lines_free(&ls); free(file); return fmt("ERROR: bad range %d-%d (file has %d lines)", s, e, ls.n); }
+    if (lines_split(&ls, file) != 0) { free(file); free(ep); return xstrdup("ERROR: OOM"); }
+    if (s < 1 || e > ls.n || e < s) {
+        lines_free(&ls); free(file); free(ep);
+        return fmt("ERROR: bad range %d-%d (file has %d lines)", s, e, ls.n);
+    }
     int removed = e - s + 1;
     char **newlines = malloc((size_t)(ls.n - removed) * sizeof(char *));
     int k = 0;
@@ -476,11 +671,14 @@ static char *t_delete_lines(const jval_t *args) {
     for (int i = e; i < ls.n; i++) newlines[k++] = ls.lines[i];
     lines_t nl2 = { newlines, k, k };
     char *out = lines_join(&nl2);
-    FILE *f = fopen(path, "w");
-    if (!f) { free(out); free(newlines); lines_free(&ls); free(file); return fmt("ERROR: cannot write '%s': %s", path, strerror(errno)); }
+    FILE *f = fopen(ep, "w");
+    if (!f) {
+        free(out); free(newlines); lines_free(&ls); free(file); free(ep);
+        return fmt("ERROR: cannot write '%s': %s", ep, strerror(errno));
+    }
     fwrite(out, 1, strlen(out), f);
     fclose(f);
-    free(out); free(newlines); lines_free(&ls); free(file);
+    free(out); free(newlines); lines_free(&ls); free(file); free(ep);
     return fmt("✓ deleted lines %d-%d from %s", s, e, path);
 }
 
@@ -489,7 +687,6 @@ static char *t_execute_command(const jval_t *args) {
     int timeout = (int)json_num(json_obj_get(args, "timeout"));
     if (!cmd[0]) return xstrdup("ERROR: command is required");
     if (timeout <= 0) timeout = 60;
-    /* fork + pipe, tee output to stdout, capture last ~200 lines, timeout via poll */
     int pipefd[2];
     if (pipe(pipefd) != 0) return fmt("ERROR: pipe: %s", strerror(errno));
     pid_t pid = fork();
@@ -534,7 +731,6 @@ static char *t_execute_command(const jval_t *args) {
         waitpid(pid, &status, 0);
     }
     cap[ccap] = 0;
-    /* keep the last 200 lines */
     int nlines = 0;
     for (size_t i = 0; i < ccap; i++) if (cap[i] == '\n') nlines++;
     char *tail = cap;
@@ -545,28 +741,34 @@ static char *t_execute_command(const jval_t *args) {
         if (p && *p) tail = (char *)p + 1;
     }
     int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 127;
-    char *out = fmt("%s%s%s", timed_out ? "ERROR: timed out after 60s\n" : "",
-                    tail, rc == 0 ? "" : "");
+    char *out;
+    if (timed_out) {
+        out = fmt("ERROR: timed out after %ds\n%s", timeout, tail);
+    } else if (WIFEXITED(status) && rc == 0) {
+        out = (tail[0]) ? xstrdup(tail) : fmt("✓ command succeeded");
+    } else {
+        out = fmt("ERROR: command exited %d\n%s", rc, tail);
+    }
     free(cap);
     return out;
 }
 
 static char *t_enter(const jval_t *args) {
-    const char *path = map_path(json_str(json_obj_get(args, "path")));
-    if (!path[0]) return xstrdup("ERROR: path is required");
-    if (chdir(path) != 0) return fmt("ERROR: cannot enter '%s': %s", path, strerror(errno));
+    const char *path = json_str(json_obj_get(args, "path"));
+    char *expanded = path_expand_home_alloc(path);
+    if (!expanded || !expanded[0]) {
+        free(expanded);
+        return xstrdup("ERROR: path is required");
+    }
+    if (chdir(expanded) != 0) {
+        char *err = fmt("ERROR: cannot enter '%s': %s (try using ~/ or the full path from pwd)", expanded, strerror(errno));
+        free(expanded);
+        return err;
+    }
+    free(expanded);
     char buf[4096];
     getcwd(buf, sizeof(buf));
     char note[1400] = "";
-    /* self-hosting: carry the binary to the new cwd so the NEXT generation
-       is written into the project the agent moved to (finish_session writes
-       the snapshot into g_self_exe's directory). rename() works on a
-       running executable on Linux — the inode stays alive, /proc/self/exe
-       follows the rename, and "Text file busy" only blocks WRITING the
-       binary, which we never do here. Skipped when the binary is already
-       in the target dir, when the target is inside the internal tree (the
-       binary would be embedded into itself at exit), or across
-       filesystems (EXDEV — the cwd move still applies, just reported). */
     if (g_self_exe[0]) {
         const char *slash = strrchr(g_self_exe, '/');
         const char *name = slash ? slash + 1 : g_self_exe;
@@ -576,8 +778,7 @@ static char *t_enter(const jval_t *args) {
             if (n >= sizeof(bindir)) n = sizeof(bindir) - 1;
             memcpy(bindir, g_self_exe, n); bindir[n] = 0;
         } else snprintf(bindir, sizeof(bindir), ".");
-        int into_internal = g_intern_root[0] &&
-            strncmp(buf, g_intern_root, strlen(g_intern_root)) == 0;
+        int into_internal = g_intern_root && strncmp(buf, g_intern_root, strlen(g_intern_root)) == 0;
         if (strcmp(bindir, buf) != 0 && !into_internal) {
             char dest[1400];
             snprintf(dest, sizeof(dest), "%s/%s", buf, name);
@@ -615,7 +816,8 @@ static char *t_todo_write(const jval_t *args) {
         int w = snprintf(out + o, 16384 - o, "%s #%d: %s [%s]\n",
                          g_todos[i].done ? "✓" : "○", i, g_todos[i].content,
                          g_todos[i].priority[0] ? g_todos[i].priority : "medium");
-        if (w > 0) o += (size_t)w;
+        if (w < 0 || (size_t)w >= 16384 - o) break;
+        o += (size_t)w;
     }
     if (o == 0) snprintf(out, 16384, "(todo list cleared)\n");
     return out;
@@ -681,8 +883,9 @@ static char *t_read_diary(const jval_t *args) {
         content[n] = 0;
         fclose(f);
         int w = snprintf(out + o, 65536 - o, "=== %s ===\n%s\n", path, content);
-        if (w > 0) o += (size_t)w;
         free(content);
+        if (w < 0 || (size_t)w >= 65536 - o) break;
+        o += (size_t)w;
         if (o > 60000) break;
     }
     if (o == 0) return xstrdup("(no diary entries in range)");
@@ -700,7 +903,6 @@ char *tools_ask_user(const char *question) {
     return xstrdup(line);
 }
 
-
 /* ---- find (pi-style: glob under a directory tree) ---- */
 static void find_walk(const char *base, const char *pattern, char *out, size_t *o, int depth) {
     if (depth > 10 || *o > 60000) return;
@@ -716,7 +918,8 @@ static void find_walk(const char *base, const char *pattern, char *out, size_t *
         } else {
             if (fnmatch(pattern, e->d_name, 0) == 0) {
                 int w = snprintf(out + *o, 65536 - *o, "%s\n", full);
-                if (w > 0) *o += (size_t)w;
+                if (w < 0 || (size_t)w >= 65536 - *o) { closedir(d); return; }
+                *o += (size_t)w;
             }
         }
     }
@@ -725,13 +928,15 @@ static void find_walk(const char *base, const char *pattern, char *out, size_t *
 
 static char *t_find(const jval_t *args) {
     const char *pattern = json_str(json_obj_get(args, "pattern"));
-    const char *path = map_path(json_str(json_obj_get(args, "path")));
-    if (!pattern[0]) return xstrdup("ERROR: pattern is required");
-    if (!path[0]) path = ".";
+    const char *path_raw = json_str(json_obj_get(args, "path"));
+    char *path = map_path_alloc(path_expand_home_alloc(path_raw));
+    if (!pattern[0]) { free(path); return xstrdup("ERROR: pattern is required"); }
+    if (!path[0]) { free(path); path = xstrdup("."); }
     char *out = malloc(65536);
     size_t o = 0;
     out[0] = 0;
     find_walk(path, pattern, out, &o, 0);
+    free(path);
     if (o == 0) { free(out); return xstrdup("no files matched"); }
     return out;
 }
@@ -741,8 +946,6 @@ static char *t_find(const jval_t *args) {
  * command runs via execv — no shell involved, so argument quoting is
  * never an issue. Captures stdout/stderr; returns a heap result string
  * ("ERROR:" prefix marks failures so the model sees them). */
-/* resolve a bare binary name through $PATH (access() doesn't search PATH,
-   so a bare-name precheck would false-negative even when installed) */
 static int termux_find(const char *name, char *out, size_t n) {
     if (strchr(name, '/')) {
         if (access(name, X_OK) != 0) return 0;
@@ -880,15 +1083,12 @@ static char *t_battery(const jval_t *args) {
 
 /* ---------------- dispatch ---------------- */
 
-
 static char *t_self_build(const jval_t *args) {
     (void)args;
-    if (!g_intern_root[0])
+    if (!g_intern_root)
         return xstrdup("ERROR: no internal tree mounted (this binary has no embedded source)");
     char src_dir[1200], sess[1200], tmpbin[1200], cmd[8192], log[65536];
     snprintf(src_dir, sizeof(src_dir), "%s/src", g_intern_root);
-    /* temp binary in the SESSION dir (never inside /internal, so it can't
-       get embedded at exit) */
     snprintf(sess, sizeof(sess), "%s", g_intern_root);
     size_t l = strlen(sess);
     if (l > 9 && strcmp(sess + l - 9, "/internal") == 0) sess[l - 9] = 0;
@@ -901,7 +1101,6 @@ static char *t_self_build(const jval_t *args) {
         unlink(tmpbin);
         return fmt("ERROR: self_build failed (rc=%d):\n%s", rc, tail);
     }
-    /* smoke-test the fresh binary */
     char smoke[8192], s2[4096];
     snprintf(smoke, sizeof(smoke), "%s --check-align 2>&1", tmpbin);
     int src = sys_run_capture(smoke, 30, s2, sizeof(s2));
@@ -912,6 +1111,61 @@ static char *t_self_build(const jval_t *args) {
         return fmt("ERROR: self_build compiled but failed the smoke test:\n%s", tail);
     }
     return xstrdup("✓ self_build OK — /internal/src compiles and passes the smoke test");
+}
+
+/* ---- LFM document workers ----
+ * The main agent spawns small LFM2.5 workers to read documents and answer
+ * questions about them. Worker source lives at /internal/src/lfm/ and the
+ * shared worker model path comes from QMA_WORKER_MODEL (or a default). */
+static const char *worker_model_path(void) {
+    static char p[1024] = "";
+    const char *e = getenv("QMA_WORKER_MODEL");
+    if (e && e[0]) return e;
+    if (!p[0])
+        snprintf(p, sizeof(p), "/data/data/com.termux/files/home/projects/models/lfm2.5:2.6b:Q4_K_M.gguf");
+    return p;
+}
+
+static char *t_worker_spawn(const jval_t *args) {
+    const char *name = json_str(json_obj_get(args, "name"));
+    const char *path = json_str(json_obj_get(args, "path"));
+    const char *doc = json_str(json_obj_get(args, "doc"));
+    const char *role = json_str(json_obj_get(args, "role"));
+    if (worker_model_load(worker_model_path()) != 0)
+        return xstrdup("ERROR: LFM worker model failed to load — set QMA_WORKER_MODEL to the lfm2.5:2.6b Q4_K_M gguf");
+    char *content = NULL;
+    if (path && path[0]) {
+        content = read_whole_file(path);
+        if (!content || strncmp(content, "ERROR:", 6) == 0)
+            return content ? content : xstrdup("ERROR: cannot read document path");
+        doc = content;
+    }
+    if (!doc || !doc[0]) { free(content); return xstrdup("ERROR: worker_spawn needs a document — pass path (preferred) or doc"); }
+    int id = worker_spawn(name, role, doc);
+    free(content);
+    if (id < 0)
+        return fmt("ERROR: worker_spawn failed (rc=%d) — worker pool full, or the document is too large for the worker context", id);
+    return fmt("✓ worker %d spawned (%s) — ask it questions with worker_ask(%d, \"...\")",
+               id, name && name[0] ? name : "unnamed", id);
+}
+
+static char *t_worker_ask(const jval_t *args) {
+    int id = (int)json_num(json_obj_get(args, "id"));
+    const char *q = json_str(json_obj_get(args, "question"));
+    int ephemeral = json_obj_get(args, "ephemeral") ? json_bool(json_obj_get(args, "ephemeral")) : 1;
+    int mt = (int)json_num(json_obj_get(args, "max_tokens"));
+    return worker_ask(id, q, ephemeral, mt);
+}
+
+static char *t_worker_close(const jval_t *args) {
+    int id = (int)json_num(json_obj_get(args, "id"));
+    if (worker_close(id) != 0) return fmt("ERROR: no such worker %d", id);
+    return fmt("✓ worker %d closed (KV freed)", id);
+}
+
+static char *t_worker_list(const jval_t *args) {
+    (void)args;
+    return worker_list();
 }
 
 int tool_dispatch(const char *name, const char *args_json, char **result) {
@@ -944,6 +1198,15 @@ int tool_dispatch(const char *name, const char *args_json, char **result) {
     else if (strcmp(name, "vibrate") == 0) r = t_vibrate(args);
     else if (strcmp(name, "battery") == 0) r = t_battery(args);
     else if (strcmp(name, "self_build") == 0) r = t_self_build(args);
+    else if (strcmp(name, "memory_write") == 0) r = agent_memory_write(args);
+    else if (strcmp(name, "memory_append") == 0) r = agent_memory_append(args);
+    else if (strcmp(name, "memory_list") == 0) r = agent_memory_list(args);
+    else if (strcmp(name, "memory_delete") == 0) r = agent_memory_delete(args);
+    else if (strcmp(name, "memory_clear") == 0) r = agent_memory_clear();
+    else if (strcmp(name, "worker_spawn") == 0) r = t_worker_spawn(args);
+    else if (strcmp(name, "worker_ask") == 0) r = t_worker_ask(args);
+    else if (strcmp(name, "worker_close") == 0) r = t_worker_close(args);
+    else if (strcmp(name, "worker_list") == 0) r = t_worker_list(args);
     else r = fmt("ERROR: unknown tool '%s'", name);
     json_free(args);
     if (!r) r = xstrdup("(no output)");
@@ -967,10 +1230,11 @@ void tools_render_header(char *out, size_t outsz) {
         "</function>\n</tool_call>\n"
         "\n<IMPORTANT>\nReminder:\n"
         "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
-        "- Call EXACTLY ONE function per message, then stop — the engine runs it and sends you the result. Wait for the result before your next call. Never chain multiple calls in one message\n"
+        "- You may emit several <tool_call> blocks in one message when the steps are independent — the engine runs them all and returns the results together\n"
         "- Required parameters MUST be specified\n"
         "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
         "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
         "</IMPORTANT>\n");
     #undef APP
 }
+

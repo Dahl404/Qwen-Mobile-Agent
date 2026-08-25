@@ -127,7 +127,7 @@ static const char *value_close(const char *vstart, const char *end,
     }
 }
 
-int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc) {
+int parse_one_tool_call_full(const char *text, const char **ppos, tool_call_t *tc, int at_end) {
     const char *p = *ppos;
     /* block start: the <tool_call> opener if it precedes a <function=, else
        a bare <function= (the model without a grammar mask frequently drops
@@ -136,14 +136,49 @@ int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc) {
     const char *fn = strstr(p, "<function=");
     if (fn && opener && opener < fn)
         fn = strstr(opener + strlen("<tool_call>"), "<function=");
-    /* block end: first of </function> or </tool_call> after the block start */
+    /* block end: first of </function> or </tool_call> after the block start.
+       If neither appears, the model often still closed every parameter but
+       dropped </function> entirely — then the block is considered complete
+       at the LAST </parameter> when the call is not being extended (the turn
+       ended, or the text after that </parameter> is not another parameter). */
     const char *blk = fn ? fn : (opener ? opener : p);
     const char *fe = strstr(blk, "</function>");
     const char *tce = strstr(blk, "</tool_call>");
-    const char *end;
+    const char *end = NULL;
+    const char *lastp = NULL;
     if (fe && (!tce || fe < tce)) end = fe;
     else if (tce) end = tce;
-    else return 0;                          /* still open: wait for more tokens */
+    else {
+        /* auto-close region: up to the next block start so a later call's
+           parameters cannot leak into this one */
+        const char *region = NULL;
+        const char *nfn = strstr(fn ? fn + 1 : blk + 1, "<function=");
+        const char *ntc = strstr(blk + 1, "<tool_call>");
+        if (nfn && (!ntc || nfn < ntc)) region = nfn;
+        else if (ntc) region = ntc;
+        for (const char *s = blk; s && (!region || s < region); ) {
+            const char *pc = strstr(s, "</parameter>");
+            if (!pc || (region && pc >= region)) break;
+            lastp = pc;
+            s = pc + strlen("</parameter>");
+        }
+        if (lastp && at_end) {
+            /* Auto-close a block whose parameters all closed but whose
+               </function> was dropped — ONLY at turn end (at_end = 1).
+               Never mid-stream: the model is usually still typing the
+               close, and the old heuristic fired on ANY non-<parameter=
+               text after the last </parameter> (e.g. the '<' of a coming
+               </function>), executing half-drafted planning calls and
+               force-ending the turn. Those calls now wait for the real
+               close or for the turn to end (finalize path). */
+            const char *after = lastp + strlen("</parameter>");
+            while (*after == ' ' || *after == '\t' || *after == '\n' || *after == '\r') after++;
+            if (*after == '\0' ||
+                strncmp(after, "<parameter=", strlen("<parameter=")) != 0)
+                end = lastp;
+        }
+        if (!end) return 0;                 /* genuinely still open */
+    }
     if (fe && end == fe) {
         *ppos = fe + strlen("</function>");
         /* consume trailing whitespace + an adjacent </tool_call> close */
@@ -151,8 +186,10 @@ int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc) {
         while (*w == '\n' || *w == '\r' || *w == ' ' || *w == '\t') w++;
         if (strncmp(w, "</tool_call>", strlen("</tool_call>")) == 0)
             *ppos = w + strlen("</tool_call>");
-    } else {
+    } else if (tce && end == tce) {
         *ppos = tce + strlen("</tool_call>");
+    } else {
+        *ppos = lastp + strlen("</parameter>");   /* auto-close */
     }
     if (!fn) return -1;                     /* block but no function: malformed */
     tc->name[0] = 0;
@@ -226,6 +263,13 @@ int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc) {
     free(keys); free(vals);
     if (!json_valid(tc->args)) return -1;   /* refuse malformed args */
     return 1;
+}
+
+/* streaming wrapper: never force-closes a block the model might still be
+   extending (at_end = 0). The finalize path passes at_end = 1 so an open
+   block with fully-closed parameters is accepted at turn end. */
+int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc) {
+    return parse_one_tool_call_full(text, ppos, tc, 0);
 }
 
 size_t u8_safe_len(const char *s, size_t len) {

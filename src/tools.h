@@ -7,6 +7,8 @@
 #ifndef TOOLS_H
 #define TOOLS_H
 
+#include "json.h"
+
 typedef struct {
     const char *name;
     const char *description;
@@ -25,6 +27,22 @@ void intern_set_root(const char *root);
 
 /* Ask the user (blocking stdin read); returns the answer (heap). */
 char *tools_ask_user(const char *question);
+
+/* Agent memory archive tools (implemented in agent.c — they need the
+   loaded model + runstate to compute real K/V for the pinned arena). */
+char *agent_memory_write(const jval_t *args);
+char *agent_memory_append(const jval_t *args);
+char *agent_memory_list(const jval_t *args);
+char *agent_memory_delete(const jval_t *args);
+char *agent_memory_clear(void);
+
+/* Re-embed every memory.json entry into the archive arena at boot. */
+void agent_memory_restore(void);
+
+/* shared small helpers (also used by agent.c's memory tools) */
+char *xstrdup(const char *s);
+char *fmt(const char *fmt, ...);
+char *read_whole_file(const char *path);
 
 /* Execute one tool call. result is heap-allocated. Returns 0 on success
  * (including tool-level errors, which are prefixed "ERROR:"). */

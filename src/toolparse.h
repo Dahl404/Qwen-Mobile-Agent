@@ -20,11 +20,18 @@ typedef struct {
 } tool_call_t;
 
 /* Parse ONE complete <tool_call> block. *ppos must point at '<tool_call>';
- * advanced past '</tool_call>' on return. Returns:
+ * advanced past the block end on return. Returns:
  *    1  block complete AND valid (name + args parse as JSON)
  *    0  block still open
  *   -1  complete but malformed (dropped)
+ * The model frequently drops the <tool_call> wrapper AND the </function>
+ * close tag; a block whose parameters have all closed is accepted at the
+ * last </parameter> ONLY at turn end (at_end = 1). During streaming
+ * (at_end = 0) a missing </function> keeps the block open — the model is
+ * usually still typing it, and eagerly closing executed half-drafted
+ * planning calls and force-ended the turn.
  */
+int parse_one_tool_call_full(const char *text, const char **ppos, tool_call_t *tc, int at_end);
 int parse_one_tool_call(const char *text, const char **ppos, tool_call_t *tc);
 
 /* length of s[0..len) that forms complete UTF-8 characters */

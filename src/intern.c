@@ -63,6 +63,10 @@ static int junk_path(const char *rel) {
         if (strncmp(comp, ".internal-", 10) == 0) return 1;
         if (strcmp(comp, "internal.blob") == 0) return 1;
         if (strcmp(comp, "selfbuild") == 0) return 1;
+        if (strncmp(comp, "selfbuild-", 10) == 0) return 1;   /* agent build artifacts */
+        if (strncmp(comp, "selfbuild-gen", 13) == 0) return 1;
+        if (strncmp(comp, ".qma-", 5) == 0) return 1;        /* local session dirs */
+        if (strcmp(comp, ".qma_tmp") == 0) return 1;
         p = e ? e + 1 : p + cl;
     }
     /* basename checks */
@@ -376,18 +380,22 @@ void intern_build_cmd(char *buf, size_t cap, const char *src, const char *out_bi
         "ecache.c", "q8k.c", "kvq.c", "intern.c",
         "json.c", "toolparse.c", "tools.c",
         "thermal.c", "selfctx.c", "agent.c",
+        "cl.c", "worker.c",
+        "lfm/lfm_gguf.c", "lfm/lfm_tokenizer.c",
+        "lfm/lfm_nn.c", "lfm/lfm_sampler.c",
     };
     snprintf(buf, cap,
         "clang -O3 -std=c99 -Wall -Wextra -Wno-unused-parameter "
-        "-mcpu=native -ffast-math -fomit-frame-pointer -pthread -o %s",
-        out_bin);
+        "-mcpu=native -ffast-math -fomit-frame-pointer -pthread "
+        "-I %s/lfm -I %s -o %s",
+        src, src, out_bin);
     size_t o = strlen(buf);
     for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
         int w = snprintf(buf + o, cap - o, " %s/%s", src, files[i]);
         if (w < 0 || (size_t)w >= cap - o) break;
         o += (size_t)w;
     }
-    snprintf(buf + o, cap - o, " -lm -pthread");
+    snprintf(buf + o, cap - o, " -lm -pthread -ldl");
 }
 
 int sys_run_capture(const char *cmd, int timeout_s, char *out, size_t cap) {

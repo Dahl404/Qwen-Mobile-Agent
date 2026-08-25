@@ -14,6 +14,7 @@
 #include "kvq.h"
 #include "qma.h"   /* half_to_float / float_to_half */
 #include <arm_neon.h>
+#include <string.h>
 
 /* ---------------- scalar helpers (also used as NEON fallback) ------------ */
 
@@ -130,7 +131,8 @@ void kvq2_dequant(const uint8_t *rec, float *y, int n) {
  * are the even/odd lanes, so zip them back into natural order. */
 static inline void expand_q4(const uint8_t *q, float d, float m,
                              float32x4_t out[8]) {
-    uint8x16_t v = vld1q_u8(q);
+    uint8x16_t v;
+    memcpy(&v, q, 16);                    // unaligned safe
     uint8x16_t lo = vandq_u8(v, vdupq_n_u8(0x0F));
     uint8x16_t hi = vshrq_n_u8(v, 4);
     uint8x16_t g[2];
@@ -153,7 +155,8 @@ static inline void expand_q4(const uint8_t *q, float d, float m,
  * the 4 shift-planes into natural lane order. */
 static inline void expand_q2(const uint8_t *q, float d, float m,
                              float32x4_t out[16]) {
-    uint8x16_t v = vld1q_u8(q);
+    uint8x16_t v;
+    memcpy(&v, q, 16);                    // unaligned safe
     uint8x16_t three = vdupq_n_u8(3);
     uint8x16_t e0 = vandq_u8(v, three);
     uint8x16_t e1 = vandq_u8(vshrq_n_u8(v, 2), three);

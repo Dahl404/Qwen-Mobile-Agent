@@ -410,6 +410,8 @@ static void session_save(void) {
     char p[1200];
     snprintf(p, sizeof(p), "%s/state.bin", g_session_dir);
     runstate_save(&g_rs, p);
+    /* persist salience + heavy-hitter arena so pinned facts survive a
+       restart (the agent archive itself is rebuilt from memory.json) */
     snprintf(p, sizeof(p), "%s/salience.bin", g_session_dir);
     hcm_save(p);
 }
@@ -802,8 +804,9 @@ static void session_init(void) {
         session_reset();
         g_rs_ready = 1;
     }
-    /* restore HCM salience (pinned heavy-hitters) when a session was
-       resumed — it was saved on exit but never loaded back */
+    /* Restore HCM salience + heavy-hitter arena so pinned facts survive a
+       restart. (The agent archive itself is rebuilt from memory.json after
+       the system prompt is ingested — see agent_memory_restore().) */
     {
         char sal[1200];
         snprintf(sal, sizeof(sal), "%s/salience.bin", g_session_dir);
@@ -851,10 +854,12 @@ static void on_signal(int sig) {
 #define SSE_HOLDBACK 32
 
 typedef struct {
-    char content[131072];   /* text content (tool XML excluded) */
+    char *content;          /* text content (tool XML excluded) */
     size_t content_len;
-    tool_call_t calls[MAX_TOOL_CALLS];
+    size_t content_cap;
+    tool_call_t *calls;     /* dynamically grown array of tool calls */
     int n_calls;
+    int calls_cap;
     int had_tool_mode;      /* model attempted a call (even if dropped) */
     int cancelled;          /* generation stopped by the user (ESC) */
 } gen_result_t;
@@ -866,11 +871,19 @@ static void apply_eos_penalty(const qma_t *m, float *logits) {
 }
 
 static void content_append(gen_result_t *res, const char *s, size_t n) {
-    if (res->content_len + n + 1 < sizeof(res->content)) {
-        memcpy(res->content + res->content_len, s, n);
-        res->content_len += n;
-        res->content[res->content_len] = 0;
+    if (res->content_len + n + 1 > res->content_cap) {
+        size_t new_cap = res->content_cap * 2;
+        if (new_cap < res->content_len + n + 1) {
+            new_cap = res->content_len + n + 1 + 4096;
+        }
+        char *new_content = realloc(res->content, new_cap);
+        if (!new_content) return;
+        res->content = new_content;
+        res->content_cap = new_cap;
     }
+    memcpy(res->content + res->content_len, s, n);
+    res->content_len += n;
+    res->content[res->content_len] = 0;
 }
 
 static void print_content(gen_result_t *res, const char *s, size_t n) {
@@ -884,19 +897,45 @@ static void print_content(gen_result_t *res, const char *s, size_t n) {
     }
 }
 
+/* 1 if `call` (a tool-call marker) sits inside an unclosed <think> block
+   in `ans` — i.e. the last <think> opener before it has no </think>
+   before it. The model plans tool calls inside its thinking; those must
+   never execute. The real call (emitted after </think>) is unaffected. */
+static int inside_think_block(const char *ans, const char *call) {
+    const char *scan = ans;
+    const char *last_open = NULL;
+    while ((scan = strstr(scan, "<think>")) != NULL && scan < call) {
+        last_open = scan;
+        scan += strlen("<think>");
+    }
+    if (!last_open) return 0;
+    const char *cl = strstr(last_open + strlen("<think>"), "</think>");
+    if (!cl) return 1;              /* think block never closed: still planning */
+    return cl > call;               /* closed after the call: call is inside it */
+}
+
 static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                           gen_result_t *res) {
     memset(res, 0, sizeof(*res));
+    res->content_cap = 131072;
+    res->content = malloc(res->content_cap);
+    if (!res->content) return -1;
+    res->content[0] = '\0';
+    res->content_len = 0;
+    res->calls = NULL;
+    res->n_calls = 0;
+    res->calls_cap = 0;
+
     g_stop_turn = 0;   /* fresh turn: clear any earlier soft stop (ESC) */
     double t_pre0 = now_s2();
     int *ids = malloc(sizeof(int) * 262144);
-    if (!ids) return -1;
+    if (!ids) { free(res->content); return -1; }
     int nids = qma_tokenize(m, prompt, ids, 262144);
-    if (nids < 0) { free(ids); return -1; }
+    if (nids < 0) { free(res->content); free(ids); return -1; }
     float *logits = malloc(sizeof(float) * N_VOCAB);
-    if (!logits) { free(ids); return -1; }
+    if (!logits) { free(res->content); free(ids); return -1; }
     if (qma_eval(m, &g_rs, ids, nids, logits, g_threads, g_prefetch, 0) != 0) {
-        free(ids); free(logits); return -1;
+        free(res->content); free(ids); free(logits); return -1;
     }
     double t_pre1 = now_s2();
     apply_eos_penalty(m, logits);
@@ -906,11 +945,11 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
 
     char *raw = malloc(RAW_CAP);
     char *ans = malloc(RAW_CAP);
-    if (!raw || !ans) { free(raw); free(ans); free(ids); free(logits); return -1; }
+    if (!raw || !ans) { free(res->content); free(raw); free(ans); free(ids); free(logits); return -1; }
     size_t raw_len = 0, ans_len = 0, reasoning_emitted = 0;
     int thinking_done = enable_thinking ? 0 : 1;
     int tool_mode = 0;
-    int force_end = 0;   /* one tool call per turn: cut generation after the first complete block */
+    int ended_clean = 0;   /* the model closed the turn itself (<|im_end|>) */
     size_t tool_scan = 0;
     /* scan cursors: raw/ans grow by appending, but ans is also front-trimmed
        (holdback emit, draft rewind, tool-call extraction). Each scan restarts
@@ -940,6 +979,7 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
         int id = nc > 0 ? sampler_pick(&sp, cand_ids, cand_lgs, nc, g_top_p) : 0;
         if (id < 0 || id >= N_VOCAB) break;
         if (id == (int)m->id_im_end || (m->tok_type[id] & 4)) {
+            ended_clean = 1;
             if (id == (int)m->id_im_end) {
                 qma_eval(m, &g_rs, &id, 1, logits, g_threads, g_prefetch, 0);
             } else {
@@ -957,15 +997,25 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
             raw_len += (size_t)pl;
             raw[raw_len] = 0;
         }
-
         if (!thinking_done) {
             /* reasoning phase — scan only the bytes appended since the last
-               token (plus an 11-byte overlap for tags split across pieces) */
+               token (plus an 11-byte overlap for tags split across pieces).
+               Reasoning ends at </think> OR at an unpaired <tool_call> —
+               qwen3.x natively stops thinking the moment it starts a call
+               (vLLM is_reasoning_end), it does NOT always emit </think>.
+               Without this, calls drafted at the end of thinking streamed
+               as reasoning and never executed. */
             size_t ts = think_scan > 11 ? think_scan - 11 : 0;
             char *close = strstr(raw + ts, "</think>");
+            char *tcall = strstr(raw + ts, "<tool_call>");
+            const char *endtag = NULL;
+            if (close && (!tcall || close <= tcall)) endtag = "</think>";
+            else if (tcall) endtag = "<tool_call>";
             think_scan = raw_len;
-            if (close) {
-                size_t pos = (size_t)(close - raw) + strlen("</think>");
+            if (endtag) {
+                const size_t etl = strlen(endtag);
+                char *mk = strstr(raw + ts, endtag);
+                size_t pos = (size_t)(mk - raw) + etl;
                 if (pos > reasoning_emitted) {
                     size_t rbl = pos - reasoning_emitted;
                     char buf[4200];
@@ -973,8 +1023,8 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                     memcpy(buf, raw + reasoning_emitted, n0);
                     buf[n0] = 0;
                     size_t tlen = strlen(buf);
-                    if (tlen >= 8 && strcmp(buf + tlen - 8, "</think>") == 0)
-                        buf[tlen - 8] = 0;
+                    if (tlen >= etl && strcmp(buf + tlen - etl, endtag) == 0)
+                        buf[tlen - etl] = 0;
                     char *op = strstr(buf, "<think>");
                     if (op) {
                         flush_piece();   /* older thinking bytes first */
@@ -996,22 +1046,21 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                 reasoning_emitted = raw_len;
             }
         } else if (tool_mode) {
-            /* tool phase: show raw tokens dim; emit completed valid calls */
+            /* tool phase: show raw tokens dim; emit completed valid calls.
+               Native qwen3.x behavior (multi_step_tool): the model may emit
+               SEVERAL complete <tool_call> blocks in one assistant message;
+               all of them execute, results fold back as one <tool_response>
+               turn, and the model continues. We scan for complete blocks
+               and record each; generation stops only when the model closes
+               the turn itself (<|im_end|>). The parser accepts bare
+               <function= blocks (dropped <tool_call> opener) and the
+               model's improvised close tags. */
             if (ans_len + (size_t)pl < RAW_CAP) {
                 memcpy(ans + ans_len, piece, (size_t)pl);
                 ans_len += (size_t)pl;
                 ans[ans_len] = 0;
             }
             print_piece(piece);
-            /* process blocks — ONE tool call per turn: as soon as a complete
-               block arrives (valid OR malformed), stop scanning, force the
-               turn to end (im_end below) and let the caller fold the result
-               back. Chaining several calls inside one ungrounded turn is
-               what made the model hallucinate worse and worse garbage
-               (observed: pwd → ls → bash with a mangled command → enter
-               with garbage args, all in a single turn). The parser accepts
-               bare <function= blocks (dropped <tool_call> opener) and the
-               model's improvised close tags. */
             for (;;) {
                 const char *base = ans + (tool_scan <= ans_len ? tool_scan : ans_len);
                 const char *t0 = strstr(base, "<tool_call>");
@@ -1024,25 +1073,31 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                 if (r == 0) break;             /* open: wait for more tokens */
                 if (r == 1) {
                     res->had_tool_mode = 1;
-                    if (res->n_calls < MAX_TOOL_CALLS) {
-                        snprintf(res->calls[res->n_calls].name,
-                                 sizeof(res->calls[res->n_calls].name), "%s", tc.name);
-                        snprintf(res->calls[res->n_calls].args,
-                                 sizeof(res->calls[res->n_calls].args), "%s", tc.args);
-                        res->n_calls++;
-                        c_reset(); c_cyan();
-                        flush_piece();   /* pending raw tokens before the ⬡ line */
-                        printf("\n⬡ %s(%s)\n", tc.name, tc.args);
-                        c_reset(); c_dim();
+                    if (res->n_calls >= res->calls_cap) {
+                        int new_cap = res->calls_cap == 0 ? 4 : res->calls_cap * 2;
+                        tool_call_t *new_calls = realloc(res->calls, sizeof(tool_call_t) * new_cap);
+                        if (!new_calls) break;
+                        res->calls = new_calls;
+                        res->calls_cap = new_cap;
                     }
+                    snprintf(res->calls[res->n_calls].name,
+                             sizeof(res->calls[res->n_calls].name), "%s", tc.name);
+                    snprintf(res->calls[res->n_calls].args,
+                             sizeof(res->calls[res->n_calls].args), "%s", tc.args);
+                    res->n_calls++;
+                    c_reset(); c_cyan();
+                    flush_piece();   /* pending raw tokens before the ⬡ line */
+                    printf("\n⬡ %s(%s)\n", tc.name, tc.args);
+                    c_reset(); c_dim();
                 } else {
                     /* malformed complete block — dropped; the caller's
                        had_tool_mode && n_calls==0 path reports it */
                     res->had_tool_mode = 1;
+                    tool_scan = (size_t)(after - ans);
+                    break;             /* malformed: stop scanning this turn */
                 }
                 tool_scan = (size_t)(after - ans);
-                force_end = 1;                 /* one call per turn */
-                break;
+                /* continue scanning for the NEXT complete block (multi-call) */
             }
         } else {
             /* answer phase: content with holdback; detect <tool_call> */
@@ -1073,7 +1128,24 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
             char *tc = strstr(ans + (stray ? 0 : as), "<tool_call>");
             char *fn = strstr(ans + (stray ? 0 : as), "<function=");
             char *tc0 = tc && (!fn || tc <= fn) ? tc : fn;
-            if (tc0) {
+            if (tc0 && inside_think_block(ans, tc0)) {
+                /* the model is PLANNING — the call sits inside an unclosed
+                   <think> block (it drafted the call as part of reasoning).
+                   Do NOT execute it. Stream it dim like thinking and keep
+                   scanning; the real call (after </think>) executes normally. */
+                size_t pre = (size_t)(tc0 - ans);
+                if (pre > 0) {
+                    size_t el = u8_safe_len(ans, pre);
+                    c_reset();
+                    print_content(res, ans, el);
+                }
+                size_t rest = ans_len - pre;
+                memmove(ans, ans + pre, rest);
+                ans_len = rest;
+                ans[ans_len] = 0;
+                ans_scan = 0;   /* rescan from the top; skip the planned call */
+                c_dim();
+            } else if (tc0) {
                 size_t pre = (size_t)(tc0 - ans);
                 if (pre > 0) {
                     size_t el = u8_safe_len(ans, pre);
@@ -1082,6 +1154,14 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
                 }
                 tool_mode = 1;
                 res->had_tool_mode = 1;   /* model attempted a call */
+                /* repeat-penalty exemption: the tag skeleton (<parameter=,
+                   </parameter>, <function=, </function>) MUST repeat
+                   verbatim for every parameter in a multi-arg call. With
+                   the penalty still active it actively suppresses the
+                   model's own required tag tokens on the 2nd+ parameter —
+                   the sampler fighting the schema it's supposed to be
+                   producing. Disable it for the rest of this call. */
+                sp.repeat_penalty = 1.0f;
                 tool_scan = 0;
                 ans_scan = 0;   /* ans now starts at the call */
                 size_t rest = ans_len - pre;
@@ -1107,16 +1187,15 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
         if (qma_eval(m, &g_rs, &id, 1, logits, g_threads, g_prefetch, 0) != 0) break;
         apply_eos_penalty(m, logits);
         ngen++;
-        if (force_end) break;   /* closing </tool_call> is in the KV; end the turn */
     }
     c_reset();
     flush_piece();
 
-    if (force_end) {
-        /* one tool call per turn: close the assistant frame NOW with
-           <|im_end|> so the caller's tool-response delta appends to a clean
-           <|im_start|>user boundary. The call's raw text is already in the
-           KV from generation; only ONE call is ever recorded per turn. */
+    /* multi-call tool turns: if the model never emitted <|im_end|> itself
+       (token cap), close the assistant frame so the caller's tool-response
+       delta appends to a clean <|im_start|>user boundary. The calls' raw
+       text is already in the KV from generation. */
+    if (tool_mode && !ended_clean) {
         int ie = (int)m->id_im_end;
         if (ie > 0) qma_eval(m, &g_rs, &ie, 1, logits, g_threads, g_prefetch, 0);
     }
@@ -1133,10 +1212,10 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
         return 0;
     }
 
-    /* finalize: flush any complete blocks, then remaining content (skipped
-       when the turn was force-ended after the first call — it is already
-       recorded, and re-scanning would double-record it) */
-    if (tool_mode && !force_end) {
+    /* finalize: flush any complete blocks, then remaining content. The
+       streaming path already recorded complete blocks; this catches any
+       block that completed right at the turn end. */
+    if (tool_mode) {
         for (;;) {
             const char *base = ans + (tool_scan <= ans_len ? tool_scan : ans_len);
             const char *t0 = strstr(base, "<tool_call>");
@@ -1145,18 +1224,26 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
             if (!blk) break;
             const char *after = blk;
             tool_call_t tc;
-            int r = parse_one_tool_call(ans, &after, &tc);
+            /* at_end = 1: accept a block whose parameters all closed even
+               if the model dropped </function> (the turn is over — it is
+               not going to write more) */
+            int r = parse_one_tool_call_full(ans, &after, &tc, 1);
             if (r == 1) {
                 res->had_tool_mode = 1;
-                if (res->n_calls < MAX_TOOL_CALLS) {
-                    snprintf(res->calls[res->n_calls].name, sizeof(res->calls[res->n_calls].name), "%s", tc.name);
-                    snprintf(res->calls[res->n_calls].args, sizeof(res->calls[res->n_calls].args), "%s", tc.args);
-                    res->n_calls++;
-                    c_cyan();
-                    flush_piece();   /* pending raw tokens before the ⬡ line */
-                    printf("\n⬡ %s(%s)\n", tc.name, tc.args);
-                    c_reset();
+                if (res->n_calls >= res->calls_cap) {
+                    int new_cap = res->calls_cap == 0 ? 4 : res->calls_cap * 2;
+                    tool_call_t *new_calls = realloc(res->calls, sizeof(tool_call_t) * new_cap);
+                    if (!new_calls) break;
+                    res->calls = new_calls;
+                    res->calls_cap = new_cap;
                 }
+                snprintf(res->calls[res->n_calls].name, sizeof(res->calls[res->n_calls].name), "%s", tc.name);
+                snprintf(res->calls[res->n_calls].args, sizeof(res->calls[res->n_calls].args), "%s", tc.args);
+                res->n_calls++;
+                c_cyan();
+                flush_piece();   /* pending raw tokens before the ⬡ line */
+                printf("\n⬡ %s(%s)\n", tc.name, tc.args);
+                c_reset();
             }
             /* r == 0 (block still open at turn end) or -1 (malformed):
                nothing more to ship. r==0 does NOT advance *ppos, so we
@@ -1195,9 +1282,14 @@ static int build_user_delta(char *buf, size_t buflen, const char *input) {
 static int build_tool_delta(char *buf, size_t buflen,
                             const char *const *results, int n,
                             const char *note) {
+    /* ensure buf is at least null-terminated even if we return early */
+    if (buflen > 0) buf[0] = '\0';
     size_t o = 0;
-    #define APP(...) do { int w = snprintf(buf + o, buflen - o, __VA_ARGS__); \
-        if (w < 0 || (size_t)w >= buflen - o) return -1; o += (size_t)w; } while (0)
+    #define APP(...) do { \
+        int w = snprintf(buf + o, buflen - o, __VA_ARGS__); \
+        if (w < 0 || (size_t)w >= buflen - o) return -1; \
+        o += (size_t)w; \
+    } while (0)
     APP("<|im_start|>user\n");
     if (note && note[0]) APP("<tool_response>\n%s\n</tool_response>", note);
     for (int i = 0; i < n; i++)
@@ -1206,6 +1298,43 @@ static int build_tool_delta(char *buf, size_t buflen,
     #undef APP
     return (int)o;
 }
+
+/* ---- dynamic builder for tool responses (no fixed limit) ---- */
+static char *build_tool_delta_dynamic(const char *const *results, int n, const char *note) {
+    size_t cap = 4096, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+
+    #define APPEND(...) do { \
+        int needed = snprintf(NULL, 0, __VA_ARGS__); \
+        if (needed < 0) goto error; \
+        if ((size_t)needed + len + 1 > cap) { \
+            cap = (len + (size_t)needed + 1) * 2; \
+            char *newbuf = realloc(buf, cap); \
+            if (!newbuf) goto error; \
+            buf = newbuf; \
+        } \
+        int written = snprintf(buf + len, cap - len, __VA_ARGS__); \
+        if (written < 0) goto error; \
+        len += (size_t)written; \
+    } while(0)
+
+    APPEND("<|im_start|>user\n");
+    if (note && note[0]) APPEND("<tool_response>\n%s\n</tool_response>", note);
+    for (int i = 0; i < n; i++) {
+        const char *res = results[i] ? results[i] : "";
+        APPEND("<tool_response>\n%s\n</tool_response>", res);
+    }
+    APPEND("<|im_end|>\n<|im_start|>assistant\n<think>\n");
+
+    buf[len] = '\0';
+    return buf;
+
+error:
+    free(buf);
+    return NULL;
+}
+#undef APPEND
 
 /* ---- agent turn ---- */
 static int agent_turn(const char *input) {
@@ -1243,6 +1372,8 @@ static int agent_turn(const char *input) {
         if (gr != 0) {
             c_red(); printf("\n[generation failed]\n"); c_reset();
             free(cur);
+            free(res->content);
+            free(res->calls);
             free(res);
             return -1;
         }
@@ -1251,22 +1382,29 @@ static int agent_turn(const char *input) {
         if (res->cancelled) {
             c_yellow(); printf("[cancelled — back to you]\n"); c_reset();
             free(cur);
+            free(res->content);
+            free(res->calls);
             free(res);
             return 0;
         }
 
         if (res->n_calls > 0) {
             /* execute every call, fold results back, call the model again */
-            char *results[MAX_TOOL_CALLS];
-            int n_res = 0;
-            for (int i = 0; i < res->n_calls; i++) {
+            /* allocate results array dynamically to avoid overflow */
+            int n_res = res->n_calls;
+            char **results = malloc(sizeof(char *) * n_res);
+            if (!results) {
+                c_red(); printf("[error: out of memory for tool results]\n"); c_reset();
+                free(cur);
+                free(res->content);
+                free(res->calls);
+                free(res);
+                return -1;
+            }
+            for (int i = 0; i < n_res; i++) {
                 char *r = NULL;
                 tool_dispatch(res->calls[i].name, res->calls[i].args, &r);
                 if (strlen(r) > 6000) {
-                    /* heap overflow fix: the "...\n[output truncated]" suffix
-                       is 26 bytes incl. NUL; the old code allocated 6004 and
-                       wrote 6026 — any output over 6000 chars overran the
-                       heap. Size to the actual suffix length instead. */
                     static const char trunc[] = "...\n[output truncated]";
                     size_t need = 6000 + sizeof(trunc);
                     char *tmp = malloc(need);
@@ -1277,18 +1415,35 @@ static int agent_turn(const char *input) {
                         r = tmp;
                     }
                 }
-                results[n_res++] = r;
+                results[i] = r;
                 if (strncmp(r, "ERROR:", 6) == 0) {
                     c_red(); printf("  ✕ %s\n", r); c_reset();
                 } else {
                     c_green(); printf("  ✓ %s\n", r); c_reset();
                 }
             }
-            build_tool_delta(g_delta, sizeof(g_delta), (const char **)results, n_res, NULL);
+
+            /* Use the dynamic builder; fallback to static if allocation fails */
+            char *delta = build_tool_delta_dynamic((const char **)results, n_res, NULL);
+            if (!delta) {
+                /* Fallback: use static builder with a note */
+                build_tool_delta(g_delta, sizeof(g_delta), (const char **)results, n_res,
+                                 "ERROR: internal memory allocation failed");
+                delta = strdup(g_delta);
+            }
             for (int i = 0; i < n_res; i++) free(results[i]);
+            free(results);
             free(cur);
-            cur = strdup(g_delta);
+            cur = delta;
             pre_rendered = 1;
+            free(res->content);
+            free(res->calls);
+            res->content = NULL;
+            res->calls = NULL;
+            res->content_len = 0;
+            res->content_cap = 0;
+            res->n_calls = 0;
+            res->calls_cap = 0;
             continue;
         }
 
@@ -1297,7 +1452,11 @@ static int agent_turn(const char *input) {
                them — feed that back as a tool error (exactly what pi does
                for a failed tool) and continue; bounded by MAX_TURNS. Show
                the EXACT format so the model can self-correct instead of
-               flailing. */
+               flailing. ALSO print it to the console — the user must see
+               what the model attempted and what it was told. */
+            c_red();
+            printf("  ✕ malformed tool call (not executed) — fed back to the model:\n");
+            c_reset();
             build_tool_delta(g_delta, sizeof(g_delta), NULL, 0,
                 "ERROR: your tool call was malformed and discarded — it NEVER "
                 "executed. The ONLY accepted format is EXACTLY:\n"
@@ -1309,14 +1468,24 @@ static int agent_turn(const char *input) {
                 "</function>\n"
                 "</tool_call>\n"
                 "Rules:\n"
-                "- wrap the whole call in <tool_call>...</tool_call>\n"
+                "- wrap each call in <tool_call>...</tool_call> (you may emit "
+                "several per message when the steps are independent)\n"
                 "- put each value on its own line under its <parameter=...> tag\n"
                 "- close every <parameter=...> with </parameter>\n"
-                "- call exactly ONE tool\n"
+                "- END the call with </function> (a call is only complete "
+                "when </function> or </tool_call> closes it)\n"
                 "Re-issue the call now in this exact format.");
             free(cur);
             cur = strdup(g_delta);
             pre_rendered = 1;
+            free(res->content);
+            free(res->calls);
+            res->content = NULL;
+            res->calls = NULL;
+            res->content_len = 0;
+            res->content_cap = 0;
+            res->n_calls = 0;
+            res->calls_cap = 0;
             continue;
         }
 
@@ -1324,6 +1493,8 @@ static int agent_turn(const char *input) {
         break;
     }
     free(cur);
+    free(res->content);
+    free(res->calls);
     free(res);
     return 0;
 }
@@ -1360,6 +1531,238 @@ static void build_system_prompt(char *buf, size_t buflen) {
             "write their compiler errors to /internal/rebuild.log so you can fix your own code "
             "next boot. Collect tools and data under /internal/tools/ and /internal/data/ to "
             "keep them forever.\n");
+    o = strlen(buf);
+    if (o + 1 < buflen)
+        snprintf(buf + o, buflen - o, "\n## Long-Term Memory — YOUR OWN ACTIVE MEMORY\n"
+            "This is not a file system, a diary, or external storage. It is YOUR OWN memory:\n"
+            "text you write there is embedded into your KV cache as real key/value vectors\n"
+            "that you attend to on EVERY token you generate. You never need a tool to read\n"
+            "it — you already see it every step, always, forever (it survives the rolling\n"
+            "context window and restarts).\n"
+            "The tools only MUTATE that memory:\n"
+            "- memory_write(\"key\", text) pins new text into it.\n"
+            "- memory_append(\"key\", text) adds to an existing entry.\n"
+            "- memory_delete(\"key\") forgets an entry.\n"
+            "- memory_list() shows what you currently have pinned (keys + sizes).\n"
+            "Use it actively, like a scratchpad that stays open in front of you:\n"
+            "- Before a multi-step task: memory_write(\"task\", ...) the user's goal and your plan.\n"
+            "- After each step: memory_append(\"task\", ...) what you did, what you found, what's next.\n"
+            "- Keep anything you must not forget (paths, decisions, constraints, open questions).\n"
+            "Because you see it on every token, keeping state there keeps you coherent across\n"
+            "the whole task AND across sessions — consolidate early and often.\n");
+    o = strlen(buf);
+    if (o + 1 < buflen)
+        snprintf(buf + o, buflen - o, "\n## Document Workers (LFM sub-agents)\n"
+            "You can spawn small worker agents (a 2.6B LFM2.5 model, weights shared) to read\n"
+            "documents and answer questions about them — instead of reading a whole file into\n"
+            "your own context, load it into a worker and interrogate it:\n"
+            "- worker_spawn(\"name\", path=\"...\") loads a file into a new worker (returns an id).\n"
+            "- worker_ask(id, question) asks it about the document. Default is EPHEMERAL: each\n"
+            "  question gets a clean KV on the same document base (the worker forgets the prior\n"
+            "  question). For follow-up chains, pass ephemeral=false — the worker keeps the\n"
+            "  conversation so follow-up questions have context.\n"
+            "- worker_close(id) frees the worker; worker_list() shows active ids.\n"
+            "Use workers for: finding exact lines, checking whether something is in a file,\n"
+            "summarizing sections, or comparing multiple documents (spawn one per doc).\n");
+}
+
+/* ---- agent memory: the manually-edited archive ring ----
+ * memory.json in the session dir is the single source of truth (you can
+ * edit it by hand). Each entry {key, content, ts} is mirrored into the KV
+ * archive arena (real K/V, always attended) via hcm_archive_*. On boot the
+ * arena is rebuilt from the file so memory survives restarts. */
+
+typedef struct { char key[64]; char *content; int64_t ts; } mem_entry_t;
+
+static const char *memory_path(void) {
+    static char p[1200];
+    if (g_session_dir[0]) snprintf(p, sizeof(p), "%s/memory.json", g_session_dir);
+    else snprintf(p, sizeof(p), "./.qma-memory.json");
+    return p;
+}
+
+/* parse memory.json into a heap array; returns count (0 = none/error) */
+static int mem_load(mem_entry_t **out) {
+    *out = NULL;
+    char *raw = read_whole_file(memory_path());
+    if (!raw || strncmp(raw, "ERROR:", 6) == 0) { free(raw); return 0; }
+    jval_t *j = json_parse(raw);
+    free(raw);
+    if (!j || j->type != J_ARR) { if (j) json_free(j); return 0; }
+    int n = 0;
+    mem_entry_t *ent = calloc(j->n ? j->n : 1, sizeof(mem_entry_t));
+    for (size_t i = 0; i < j->n; i++) {
+        const jval_t *o = json_arr_get(j, i);
+        const char *k = json_str(json_obj_get(o, "key"));
+        const char *c = json_str(json_obj_get(o, "content"));
+        if (!k[0]) continue;
+        snprintf(ent[n].key, sizeof(ent[n].key), "%s", k);
+        ent[n].content = strdup(c);
+        ent[n].ts = (int64_t)json_num(json_obj_get(o, "ts"));
+        n++;
+    }
+    json_free(j);
+    *out = ent;
+    return n;
+}
+
+static void mem_free(mem_entry_t *ent, int n) {
+    for (int i = 0; i < n; i++) free(ent[i].content);
+    free(ent);
+}
+
+static int mem_find(mem_entry_t *ent, int n, const char *key) {
+    for (int i = 0; i < n; i++) if (strcmp(ent[i].key, key) == 0) return i;
+    return -1;
+}
+
+static int mem_save(mem_entry_t *ent, int n) {
+    size_t cap = 4096;
+    for (int i = 0; i < n; i++) cap += strlen(ent[i].key) + strlen(ent[i].content) * 2 + 64;
+    char *buf = malloc(cap);
+    if (!buf) return -1;
+    size_t o = 0;
+    o += (size_t)snprintf(buf + o, cap - o, "[");
+    for (int i = 0; i < n; i++) {
+        char ke[160], ce[131072];
+        json_quote_escape(ent[i].key, ke, sizeof(ke));
+        json_quote_escape(ent[i].content, ce, sizeof(ce));
+        int w = snprintf(buf + o, cap - o, "%s{\"key\":%s,\"content\":%s,\"ts\":%lld}",
+                         i ? "," : "", ke, ce, (long long)ent[i].ts);
+        if (w < 0 || (size_t)w >= cap - o) { free(buf); return -1; }
+        o += (size_t)w;
+    }
+    o += (size_t)snprintf(buf + o, cap - o, "]");
+    FILE *f = fopen(memory_path(), "w");
+    if (!f) { free(buf); return -1; }
+    fwrite(buf, 1, o, f);
+    fclose(f);
+    free(buf);
+    return 0;
+}
+
+char *agent_memory_write(const jval_t *args) {
+    const char *key = json_str(json_obj_get(args, "key"));
+    const char *content = json_str(json_obj_get(args, "content"));
+    if (!key[0]) return xstrdup("ERROR: memory_write requires a non-empty key");
+    if (!content[0]) return xstrdup("ERROR: memory_write requires non-empty content");
+    if (!g_rs_ready) return xstrdup("ERROR: model not ready");
+    int rc = hcm_archive_write(&g_model, &g_rs, key, content, g_threads);
+    if (rc < 0) {
+        if (rc == -2) return xstrdup("ERROR: memory archive requires quantized KV (QMA_KVQ unset — the default)");
+        if (rc == -3) return xstrdup("ERROR: memory archive is full — memory_delete() something first");
+        return xstrdup("ERROR: failed to embed memory entry (eval error)");
+    }
+    mem_entry_t *ent = NULL; int n = mem_load(&ent);
+    int i = mem_find(ent, n, key);
+    if (i < 0) {
+        ent = realloc(ent, sizeof(mem_entry_t) * (n + 1));
+        if (!ent) return xstrdup("ERROR: OOM");
+        i = n;
+        snprintf(ent[i].key, sizeof(ent[i].key), "%s", key);
+        ent[i].content = NULL;
+        n++;
+    } else {
+        free(ent[i].content);
+    }
+    ent[i].content = strdup(content);
+    ent[i].ts = (int64_t)time(NULL);
+    if (mem_save(ent, n) != 0) { mem_free(ent, n); return xstrdup("ERROR: cannot write memory.json"); }
+    char *r = fmt("✓ memory '%s' pinned (%d tokens, always attended)", key, rc);
+    mem_free(ent, n);
+    return r;
+}
+
+char *agent_memory_append(const jval_t *args) {
+    const char *key = json_str(json_obj_get(args, "key"));
+    const char *content = json_str(json_obj_get(args, "content"));
+    if (!key[0]) return xstrdup("ERROR: memory_append requires a non-empty key");
+    if (!content[0]) return xstrdup("ERROR: memory_append requires non-empty content");
+    if (!g_rs_ready) return xstrdup("ERROR: model not ready");
+    mem_entry_t *ent = NULL; int n = mem_load(&ent);
+    int i = mem_find(ent, n, key);
+    /* for a fresh key memory_append behaves like memory_write */
+    if (i < 0) {
+        mem_free(ent, n);
+        return agent_memory_write(args);
+    }
+    int rc = hcm_archive_append(&g_model, &g_rs, key, content, g_threads);
+    if (rc == -4) {
+        /* the entry is not the last pinned range (other entries were
+           written after it) — appending in place would overwrite them, so
+           re-embed the full combined text instead */
+        size_t oldl = strlen(ent[i].content), newl = oldl + strlen(content) + 2;
+        char *combined = malloc(newl);
+        if (!combined) { mem_free(ent, n); return xstrdup("ERROR: OOM"); }
+        snprintf(combined, newl, "%s\n%s", ent[i].content, content);
+        rc = hcm_archive_write(&g_model, &g_rs, key, combined, g_threads);
+        free(combined);
+    }
+    if (rc < 0) { mem_free(ent, n); return xstrdup("ERROR: failed to append memory entry (eval error)"); }
+    size_t oldl = strlen(ent[i].content), newl = oldl + strlen(content) + 2;
+    char *nc = malloc(newl);
+    if (!nc) { mem_free(ent, n); return xstrdup("ERROR: OOM"); }
+    snprintf(nc, newl, "%s\n%s", ent[i].content, content);
+    free(ent[i].content);
+    ent[i].content = nc;
+    ent[i].ts = (int64_t)time(NULL);
+    if (mem_save(ent, n) != 0) { mem_free(ent, n); return xstrdup("ERROR: cannot write memory.json"); }
+    char *r = fmt("✓ memory '%s' extended (%d tokens)", key, rc);
+    mem_free(ent, n);
+    return r;
+}
+
+char *agent_memory_list(const jval_t *args) {
+    (void)args;
+    mem_entry_t *ent = NULL; int n = mem_load(&ent);
+    if (n == 0) { mem_free(ent, n); return xstrdup("(memory archive is empty)"); }
+    size_t cap = 4096 + n * 128;
+    char *out = malloc(cap); size_t o = 0;
+    for (int i = 0; i < n; i++) {
+        int w = snprintf(out + o, cap - o, "%s%-32s %zu tokens\n",
+                         i ? "" : "", ent[i].key, strlen(ent[i].content) / 4);
+        if (w < 0 || (size_t)w >= cap - o) break;
+        o += (size_t)w;
+    }
+    mem_free(ent, n);
+    return out;
+}
+
+char *agent_memory_delete(const jval_t *args) {
+    const char *key = json_str(json_obj_get(args, "key"));
+    if (!key[0]) return xstrdup("ERROR: memory_delete requires a key");
+    hcm_archive_delete(&g_rs, key);
+    mem_entry_t *ent = NULL; int n = mem_load(&ent);
+    int i = mem_find(ent, n, key);
+    if (i < 0) { mem_free(ent, n); return fmt("ERROR: no memory entry named '%s'", key); }
+    free(ent[i].content);
+    for (int j = i; j < n - 1; j++) ent[j] = ent[j + 1];
+    n--;
+    if (mem_save(ent, n) != 0) { mem_free(ent, n); return xstrdup("ERROR: cannot write memory.json"); }
+    mem_free(ent, n);
+    return fmt("✓ memory '%s' deleted (KV slots freed)", key);
+}
+
+char *agent_memory_clear(void) {
+    hcm_archive_clear(&g_rs);
+    if (mem_save(NULL, 0) != 0) return xstrdup("ERROR: cannot write memory.json");
+    return xstrdup("✓ memory archive cleared");
+}
+
+/* boot: re-embed every memory.json entry into the archive arena (in file
+   order) so pinned memories survive a restart. Called after the system
+   prompt is ingested and the runstate is ready. */
+void agent_memory_restore(void) {
+    if (!g_rs_ready) return;
+    mem_entry_t *ent = NULL; int n = mem_load(&ent);
+    for (int i = 0; i < n; i++) {
+        int rc = hcm_archive_write(&g_model, &g_rs, ent[i].key, ent[i].content, g_threads);
+        if (rc < 0)
+            fprintf(stderr, "[memory] failed to restore '%s' (rc=%d)\n", ent[i].key, rc);
+        else
+            fprintf(stderr, "[memory] restored '%s' (%d tokens)\n", ent[i].key, rc);
+    }
+    mem_free(ent, n);
 }
 
 /* ---- main ---- */
@@ -1522,12 +1925,14 @@ int main(int argc, char **argv) {
     }
 
     /* session mode: --session <dir> = classic persistent dir (no
-       snapshots); default = temp dir + dated context snapshot on exit */
+       snapshots); default = a hidden session dir in the LOCAL folder (the
+       cwd qma runs from — never a system tmp: Termux's usr/tmp is a plain
+       directory, not a real tmpfs, and can be cleaned or removed out from
+       under us) + dated context snapshot on exit. The session dir is
+       transient: wiped on a clean exit after the context is embedded. */
     if (!g_session_dir[0]) {
-        const char *tmp = getenv("TMPDIR");
         char tmpl[1200];
-        snprintf(tmpl, sizeof(tmpl), "%s/qma-XXXXXX",
-                 tmp && tmp[0] ? tmp : "/data/data/com.termux/files/usr/tmp");
+        snprintf(tmpl, sizeof(tmpl), ".qma-XXXXXX");
         char *d = mkdtemp(tmpl);
         if (d) {
             snprintf(g_session_dir, sizeof(g_session_dir), "%s", d);
@@ -1536,7 +1941,7 @@ int main(int argc, char **argv) {
             snprintf(g_session_dir, sizeof(g_session_dir), ".qma_tmp");
         }
         g_selfctx = 1;
-        fprintf(stderr, "qma: snapshot mode — context embedded in a dated copy of the binary on exit\n");
+        fprintf(stderr, "qma: snapshot mode — session dir in the local folder, context embedded in a dated copy of the binary on exit\n");
     }
     if (g_reset) {
         fprintf(stderr, "qma: reset — ignoring any embedded context\n");
@@ -1570,6 +1975,10 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "qma: resumed session at n_pos=%d (context kept)\n", g_rs.n_pos);
     }
+
+    /* re-embed the agent's archive (memory.json) into the KV arena so
+       pinned memories survive restarts */
+    if (g_rs_ready) agent_memory_restore();
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -1631,3 +2040,5 @@ int main(int argc, char **argv) {
     qma_free(&g_model);
     return 0;
 }
+
+

@@ -439,6 +439,7 @@ int qma_tokenize(qma_t *m, const char *text, int *out, int max_out) {
             for (int k = 0; k < wlen_cpt; k++) {
                 char tmp[8]; cpt_to_utf8(cpts[wstart + k], tmp);
                 int tl = (int)strlen(tmp);
+                if (wu + tl > (int)sizeof(wutf8)) break;   // word too long for the buffer; stop rather than overflow
                 memcpy(wutf8 + wu, tmp, tl); wu += tl;
             }
             wstart += wlen_cpt;
@@ -474,3 +475,4 @@ int qma_detokenize(qma_t *m, const int *tokens, int n, char *out, int max_out) {
     out[o] = 0;
     return o;
 }
+

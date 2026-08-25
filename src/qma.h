@@ -302,9 +302,20 @@ int      qma_kvq_on(void);
    Returns 0 ok. */
 int      runstate_save(runstate_t *rs, const char *path);
 int      runstate_load(runstate_t *rs, const char *path);
-/* HCM salience persistence (pinned heavy-hitters survive restarts) */
+/* HCM salience + heavy-hitter arena persistence (restart survival) */
 int      hcm_save(const char *path);
 int      hcm_load(const char *path, int n_ctx);
+/* agent archive (the manually-edited memory ring): memory_* tools pin
+   real K/V into a protected arena that attention always reads. Survives
+   ring wrap; rebuilt from memory.json at boot. Returns token count or <0
+   on error (-2 = archive needs quantized KV). */
+int      hcm_archive_write(qma_t *m, runstate_t *rs, const char *key,
+                           const char *content, int n_threads);
+int      hcm_archive_append(qma_t *m, runstate_t *rs, const char *key,
+                            const char *content, int n_threads);
+int      hcm_archive_delete(runstate_t *rs, const char *key);
+int      hcm_archive_clear(runstate_t *rs);
+int      hcm_archive_count(void);
 void     runstate_free(runstate_t *rs);
 
 /* weight streaming: prefetch setup + per-layer lookahead (dist layers) */
@@ -364,6 +375,13 @@ float    qma_q8k_dot(const void *row, int wtype, const int8_t *xq,
 void     qma_q8k_gateup(const void *g, const void *u, const int8_t *xq,
                            const float *xd, const int16_t *xsum, int n,
                            float *gate, float *up);
+/* i8mm GEMM: Q4_K weights x q8 activations, T >= 2 tokens at once.
+ * Computes rows [r0, r0+nrows), nrows must be even. */
+int      qma_q8k_gemm_available(void);
+void     qma_q8k_gemm_q4k(const uint8_t *W, size_t wrow, int r0, int nrows,
+                          const int8_t *xq, const float *xd,
+                          const int16_t *xsum, int n_in, int n_out,
+                          int T, float *out);
 
 /* one-time model alignment (see gguf.c): 1 = needs 4K repack, 0 = aligned,
    -1 = error */
