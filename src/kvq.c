@@ -242,3 +242,96 @@ void kvq2_vacc(const uint8_t *rec, float w, float *oacc, int n) {
                       vmlaq_f32(vld1q_f32(o + k * 4), wv, e[k]));
     }
 }
+
+/* ---------------- int8-quantized-query SDOT kernels ----------------------
+ * The score pass re-reads the same fp32 query for every attended slot.
+ * Quantize q ONCE per (head, token) into per-32-lane sub-block int8 with
+ * amax scales, then each slot dot becomes nibble-expand + 2x SDOT + a
+ * scale fold -- the same math class as the q8k expert kernels:
+ *   dot(K,x) ~= SUM_sb [ d_sb*xsb*IDOT_sb + m_sb*xsb*XSUM_sb ]
+ * where IDOT = SUM kq*xq (int32 via SDOT), XSUM = SUM xq (precomputed).
+ * Extra error is the usual activation-quantization noise (~0.3% rel). */
+
+/* quantize one head's query: n lanes (multiple of 32). xsb = per-sub-block
+   scale; xsum = per-sub-block int sum of the quantized lanes. */
+void kvq_q_quant(const float *x, int n, int8_t *xq, float *xsb, int *xsum)
+{
+    const int sb_n = 32;
+    const int nsub = n / sb_n;
+    const int32x4_t hi127 = vdupq_n_s32(127), lo127 = vdupq_n_s32(-127);
+    for (int sb = 0; sb < nsub; sb++) {
+        const float *xp = x + sb * sb_n;
+        int8_t *qp = xq + sb * sb_n;
+        float32x4_t am = vdupq_n_f32(0.0f);
+        for (int i = 0; i < sb_n; i += 4)
+            am = vmaxq_f32(am, vabsq_f32(vld1q_f32(xp + i)));
+        const float amax = vmaxvq_f32(am);
+        const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+        xsb[sb] = s;
+        const float inv = 1.0f / s;
+
+        /* convert 32 lanes -> clamped int8 (two 16-byte halves) */
+        float32x4_t m0 = vmulq_n_f32(vld1q_f32(xp), inv);
+        float32x4_t m1 = vmulq_n_f32(vld1q_f32(xp + 4), inv);
+        float32x4_t m2 = vmulq_n_f32(vld1q_f32(xp + 8), inv);
+        float32x4_t m3 = vmulq_n_f32(vld1q_f32(xp + 12), inv);
+        float32x4_t m4 = vmulq_n_f32(vld1q_f32(xp + 16), inv);
+        float32x4_t m5 = vmulq_n_f32(vld1q_f32(xp + 20), inv);
+        float32x4_t m6 = vmulq_n_f32(vld1q_f32(xp + 24), inv);
+        float32x4_t m7 = vmulq_n_f32(vld1q_f32(xp + 28), inv);
+        int32x4_t r0 = vcvtmq_s32_f32(m0);
+        int32x4_t r1 = vcvtmq_s32_f32(m1);
+        int32x4_t r2 = vcvtmq_s32_f32(m2);
+        int32x4_t r3 = vcvtmq_s32_f32(m3);
+        int32x4_t r4 = vcvtmq_s32_f32(m4);
+        int32x4_t r5 = vcvtmq_s32_f32(m5);
+        int32x4_t r6 = vcvtmq_s32_f32(m6);
+        int32x4_t r7 = vcvtmq_s32_f32(m7);
+        r0 = vminq_s32(vmaxq_s32(r0, lo127), hi127);
+        r1 = vminq_s32(vmaxq_s32(r1, lo127), hi127);
+        r2 = vminq_s32(vmaxq_s32(r2, lo127), hi127);
+        r3 = vminq_s32(vmaxq_s32(r3, lo127), hi127);
+        r4 = vminq_s32(vmaxq_s32(r4, lo127), hi127);
+        r5 = vminq_s32(vmaxq_s32(r5, lo127), hi127);
+        r6 = vminq_s32(vmaxq_s32(r6, lo127), hi127);
+        r7 = vminq_s32(vmaxq_s32(r7, lo127), hi127);
+        int16x8_t h01 = vcombine_s16(vqmovn_s32(r0), vqmovn_s32(r1));
+        int16x8_t h23 = vcombine_s16(vqmovn_s32(r2), vqmovn_s32(r3));
+        int16x8_t h45 = vcombine_s16(vqmovn_s32(r4), vqmovn_s32(r5));
+        int16x8_t h67 = vcombine_s16(vqmovn_s32(r6), vqmovn_s32(r7));
+        int8x16_t b03 = vcombine_s8(vqmovn_s16(h01), vqmovn_s16(h23));
+        int8x16_t b47 = vcombine_s8(vqmovn_s16(h45), vqmovn_s16(h67));
+
+        /* de-interleave: KVQ4 packs byte j = lanes {2j,2j+1}; the SDOT
+           kernel consumes evens from xq[0..15], odds from xq[16..31] */
+        vst1q_s8(qp, vuzp1q_s8(b03, b47));
+        vst1q_s8(qp + 16, vuzp2q_s8(b03, b47));
+
+        xsum[sb] = vaddlvq_s8(b03) + vaddlvq_s8(b47);
+    }
+}
+
+/* dot of one KVQ4 record against the pre-quantized query.
+ * rec: 160 B record (8 sub-blocks); xq: int8[n]; xsb: scales[n/32];
+ * xsum: int sums[n/32]. */
+float kvq4_dot_q8(const uint8_t *rec, const int8_t *xq,
+                  const float *xsb, const int *xsum, int n)
+{
+    const int nsub = n / 32;
+    const uint8x16_t loM = vdupq_n_u8(0x0F);
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    float bias = 0.0f;
+    for (int sb = 0; sb < nsub; sb++) {
+        float d, m; sub_meta(rec, sb, &d, &m);
+        const uint8_t *qn = rec + sb * 20 + 4;
+        const int8_t *xp = xq + sb * 32;
+        uint8x16_t v = *(const uint8x16_t *)qn;
+        int8x16_t klo = vreinterpretq_s8_u8(vandq_u8(v, loM));
+        int8x16_t khi = vreinterpretq_s8_u8(vshrq_n_u8(v, 4));
+        int32x4_t idot = vdotq_s32(vdupq_n_s32(0), klo, vld1q_s8(xp));
+        idot = vdotq_s32(idot, khi, vld1q_s8(xp + 16));
+        acc = vfmaq_n_f32(acc, vcvtq_f32_s32(idot), d * xsb[sb]);
+        bias += m * xsb[sb] * (float)xsum[sb];
+    }
+    return vaddvq_f32(acc) + bias;
+}

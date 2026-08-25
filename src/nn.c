@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdlib.h>
 #include <time.h>
 #include <arm_neon.h>
 #include <sched.h>
@@ -828,6 +829,10 @@ static void moe_ffn(qma_t *m, int il, const float *x, const float *r_l, float *o
     }
 }
 
+/* MoE phase timers (aggregated us; exposed for harnesses/profiles) */
+double g_moe_fetch_us = 0, g_moe_comp_us = 0, g_moe_fetched = 0;
+void qma_moe_timers_reset(void) { g_moe_fetch_us = g_moe_comp_us = g_moe_fetched = 0; }
+
 /* one (token, expert) task: fetch the record, compute the weighted partial */
 static void moe_xpar_worker(void *arg, int b, int e)
 {
@@ -845,6 +850,7 @@ static void moe_xpar_worker(void *arg, int b, int e)
         const size_t dn = (size_t)N_EMBD * N_FF_EXP *
             (m->layers[il].t_down_exps == GGML_TYPE_Q4_K ? sizeof(block_q4_K) : sizeof(block_q6_K)) / QK_K;
         const uint8_t *ge = NULL, *ue = NULL, *de = NULL;
+        double tf = now_s();
         if (m->mmap_exps) {
             /* zero-copy: point the matmul directly at the mapped file pages.
                The kernel page cache is the cache; madvise (--preload) keeps
@@ -862,7 +868,14 @@ static void moe_xpar_worker(void *arg, int b, int e)
                 size_t need = 2 * ge_bytes + dn;
                 if (!miss_buf || miss_cap < need) {
                     free(miss_buf);
-                    miss_buf = malloc(need);
+                    /* 4K-aligned: with .4k-aligned GGUFs every slab offset and
+                       size is a 4096 multiple, so O_DIRECT can serve these
+                       reads straight into the buffer (no page-cache fill,
+                       no post-fetch drop needed). */
+                    void *ap = NULL;
+                    if (posix_memalign(&ap, 4096, (need + 4095) & ~4095UL) != 0)
+                        ap = malloc(need);   /* fallback: unaligned, buffered */
+                    miss_buf = ap;
                     miss_cap = need;
                 }
                 if (miss_buf && expert_fetch(m, il, ex, miss_buf) == 0)
@@ -876,10 +889,13 @@ static void moe_xpar_worker(void *arg, int b, int e)
                 memset(acc, 0, N_EMBD * sizeof(float));
                 continue;
             }
+            g_moe_fetch_us += (now_s() - tf) * 1e6;
+            g_moe_fetched += 1;
             ge = rec;
             ue = rec + ge_bytes;
             de = rec + 2 * ge_bytes;
         }
+        double tc = now_s();
         if (xa->q8k) {
             int8_t gq[N_FF_EXP]; float gd[N_FF_EXP / QK_K]; int16_t gs[N_FF_EXP / 16];
             moe_expert_one_q8k(ge, ue, de, m->layers[il].t_down_exps,
@@ -890,6 +906,7 @@ static void moe_xpar_worker(void *arg, int b, int e)
         } else {
             moe_expert_one(ge, ue, de, m->layers[il].t_down_exps, xp, we, acc);
         }
+        g_moe_comp_us += (now_s() - tc) * 1e6;
     }
 }
 
@@ -1104,6 +1121,7 @@ static inline int hcm_slot(int p, int n_ctx) {
 }
 static int hcm_on = -1;      /* -1 = detect env, then 0/1 */
 static int kvq_on = -1;      /* -1 = detect env (QMA_KVQ=0 disables), then 0/1 */
+static int kvqi8_on = -1;    /* QMA_KVQI8=0 -> fp32-expansion score kernel */
 static float *hcm_sal[N_ATTN_LAYER];   /* [lay][n_ctx] accumulated mass (ring slots) */
 static float *hcm_qf;                   /* [n_ctx] Q-Hitter quantization friendliness
                                            (lower = quantizes better; 0 = unknown) */
@@ -1631,9 +1649,27 @@ static void attn_worker(void *arg, int i0, int i1) {
         const uint8_t *ArK = kvq && c->arc_kv ? c->arc_kv + (size_t)kh * HCM_ARC_MAX * KVQ_SLOT : NULL;
         const uint8_t *ArV = kvq && c->arc_kv ? c->arc_kv + (size_t)(N_HEAD_KV + kh) * HCM_ARC_MAX * KVQ_SLOT : NULL;
         float *sal = hcm_on ? hcm_sal[lay] : NULL;
+        if (kvqi8_on < 0)
+            kvqi8_on = getenv("QMA_KVQI8") == NULL || getenv("QMA_KVQI8")[0] != '0';
+        /* int8-quantized query scratch (one per head-token; the SDOT score
+           kernel then runs per slot without re-widening K nibbles) */
+        static _Thread_local int8_t  t_qi8[N_EMBD_HEAD];
+        static _Thread_local float   t_qxs[N_EMBD_HEAD / 32];
+        static _Thread_local int     t_qsum[N_EMBD_HEAD / 32];
+        const int use_i8 = kvq && kvqi8_on;
+        /* i8 scores win once enough slots amortize the one-off query
+           quantization; at tiny attended counts fp32 expansion is cheaper */
+        enum { KVQI8_MIN_SLOTS = 64 };
         for (int t = 0; t < c->T; t++) {
             const int abs = c->n_pos + t;
             const float *q = c->Q + (size_t)t * WQ_DIM + (size_t)h * (hd * 2);
+            const int nl_est = (hcm_on && c->n_live > 0) ? c->n_live : (abs + 1);
+            const int nk_est = nl_est + (abs - (hcm_on ? hcm_rebuilt_at : 0) + 1);
+            const int i8_here = use_i8 && nk_est >= KVQI8_MIN_SLOTS;
+            if (i8_here) kvq_q_quant(q, hd, t_qi8, t_qxs, t_qsum);
+            const int8_t *qi8 = i8_here ? t_qi8 : NULL;
+            const float   *qsx = i8_here ? t_qxs : NULL;
+            const int     *qss = i8_here ? t_qsum : NULL;
             /* K/V were appended to the cache by the caller (see
                kv_append below) before the parallel head loop ran.
                Attention reads the LIVE index (sink + hot + pinned + gist)
@@ -1655,7 +1691,8 @@ static void attn_worker(void *arg, int i0, int i1) {
                         const int sl = hcm_live[j];   /* ring slot */
                         const uint8_t *kp = Ks + (size_t)sl * KVQ_SLOT;
                         KP_CHECK(kp, ring_lo, ring_hi, "ring-q4", sl);
-                        float s = kvq4_dot(kp, q, hd) * scale;
+                        float s = (qi8 ? kvq4_dot_q8(kp, qi8, qsx, qss, hd)
+                                   : kvq4_dot(kp, q, hd)) * scale;
                         scores[j] = s;
                         if (s > maxs) maxs = s;
                     }
@@ -1670,7 +1707,8 @@ static void attn_worker(void *arg, int i0, int i1) {
                         KP_CHECK(kp, (v >= HCM_ARC_BASE ? arc_lo : pin_lo),
                                      (v >= HCM_ARC_BASE ? arc_hi : pin_hi),
                                      (v >= HCM_ARC_BASE ? "archive" : "pin-arena"), a);
-                        float s = kvq4_dot(kp, q, hd) * scale;
+                        float s = (qi8 ? kvq4_dot_q8(kp, qi8, qsx, qss, hd)
+                                   : kvq4_dot(kp, q, hd)) * scale;
                         scores[j] = s;
                         if (s > maxs) maxs = s;
                     }
@@ -1703,7 +1741,8 @@ static void attn_worker(void *arg, int i0, int i1) {
                     if (kvq) {
                         const uint8_t *kp = Ks + (size_t)hcm_slot(p, c->n_ctx) * KVQ_SLOT;
                         KP_CHECK(kp, ring_lo, ring_hi, "batch-lo", hcm_slot(p, c->n_ctx));
-                        s = kvq4_dot(kp, q, hd) * scale;
+                        s = (qi8 ? kvq4_dot_q8(kp, qi8, qsx, qss, hd)
+                               : kvq4_dot(kp, q, hd)) * scale;
                     } else {
                         const float *kp = Kc + (size_t)hcm_slot(p, c->n_ctx) * hd;
                         s = f32_kvdot(q, kp, hd) * scale;
@@ -1719,7 +1758,8 @@ static void attn_worker(void *arg, int i0, int i1) {
                     if (kvq) {
                         const uint8_t *kp = Ks + (size_t)hcm_slot(p, c->n_ctx) * KVQ_SLOT;
                         KP_CHECK(kp, ring_lo, ring_hi, "dense", hcm_slot(p, c->n_ctx));
-                        s = kvq4_dot(kp, q, hd) * scale;
+                        s = (qi8 ? kvq4_dot_q8(kp, qi8, qsx, qss, hd)
+                               : kvq4_dot(kp, q, hd)) * scale;
                     } else {
                         const float *kp = Kc + (size_t)hcm_slot(p, c->n_ctx) * hd;
                         s = f32_kvdot(q, kp, hd) * scale;
@@ -1967,7 +2007,12 @@ static int expert_fetch(void *user, int layer, int expert, uint8_t *dst)
     /* O_DIRECT path: expert bytes land straight in the pool — no page-cache
        copy at all. Only when the fd exists AND the destination is 4K-aligned
        (O_DIRECT requires an aligned buffer; pool slots are 16K-aligned). */
-    const int use_dio = (m->dio_fd >= 0) && (((uintptr_t)dst & 4095u) == 0);
+    /* Measured on-device: buffered reads + warm page cache beat O_DIRECT
+       by ~15% end-to-end (locality turns the cache into a free tier).
+       QMA_DIO=1 restores direct I/O. */
+    static int use_dio_env = -1;
+    if (use_dio_env < 0) use_dio_env = getenv("QMA_DIO") != NULL;
+    const int use_dio = use_dio_env && (m->dio_fd >= 0) && (((uintptr_t)dst & 4095u) == 0);
     const int fd = use_dio ? m->dio_fd : m->fd;
     if (pread_all(fd, dst, gu, m->layers[layer].off_gate_exps + (size_t)expert * gu) != 0)
         return -1;
@@ -1980,10 +2025,18 @@ static int expert_fetch(void *user, int layer, int expert, uint8_t *dst)
        mmap in this mode (trunk only), so drop the file-side copies: no
        double-buffer, no cache churn evicting trunk pages. No-op if the
        pages aren't resident; skipped entirely on the O_DIRECT path. */
+    /* O_DIRECT reads never touch page cache -> nothing to drop. For the
+       buffered fallback we still drop pages to keep RAM bounded (the old
+       unconditional behavior); QMA_KEEPEXP=1 keeps them instead when the
+       user prefers speed over a strict RAM ceiling. */
     if (!use_dio && m->map) {
-        madvise(m->map + m->layers[layer].off_gate_exps + (size_t)expert * gu, gu, MADV_DONTNEED);
-        madvise(m->map + m->layers[layer].off_up_exps   + (size_t)expert * gu, gu, MADV_DONTNEED);
-        madvise(m->map + m->layers[layer].off_down_exps + (size_t)expert * dn, dn, MADV_DONTNEED);
+        static int drop_exp = -1;
+        if (drop_exp < 0) drop_exp = getenv("QMA_EXPDROP") != NULL;
+        if (drop_exp) {
+            madvise(m->map + m->layers[layer].off_gate_exps + (size_t)expert * gu, gu, MADV_DONTNEED);
+            madvise(m->map + m->layers[layer].off_up_exps   + (size_t)expert * gu, gu, MADV_DONTNEED);
+            madvise(m->map + m->layers[layer].off_down_exps + (size_t)expert * dn, dn, MADV_DONTNEED);
+        }
     }
     return 0;
 }

@@ -39,6 +39,13 @@ void kvq2_dequant(const uint8_t *rec, float *y, int n);
 
 /* Q.K dot: score += dequant(rec)[i] * x[i] over n=256 lanes (NEON) */
 float kvq4_dot(const uint8_t *rec, const float *x, int n);
+
+/* int8-query SDOT variants: quantize the query ONCE per (head, token),
+   then score many slots with integer dots + per-sub-block scale folds.
+   Extra error ~ activation-quantization noise (~0.3% rel). */
+void kvq_q_quant(const float *x, int n, int8_t *xq, float *xsb, int *xsum);
+float kvq4_dot_q8(const uint8_t *rec, const int8_t *xq,
+                  const float *xsb, const int *xsum, int n);
 float kvq2_dot(const uint8_t *rec, const float *x, int n);
 
 /* weighted V accumulate: oacc[i] += w * dequant(rec)[i] over n lanes.
