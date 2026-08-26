@@ -36,7 +36,7 @@
 #include "selfctx.h"
 #include "intern.h"
 
-static const char *DEFAULT_MODEL = "/data/data/com.termux/files/home/projects/models/qwen3.6:35b:a3b-q4km.gguf";
+static const char *DEFAULT_MODEL = "/data/data/com.termux/files/home/projects/models/qwen3.6:35b:a3b-q4km.gguf.4k";
 
 /* ---- config ---- */
 static int g_threads = 8, g_ctx = 65536, g_prefetch = 4;
