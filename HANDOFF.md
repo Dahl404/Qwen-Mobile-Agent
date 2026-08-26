@@ -93,3 +93,29 @@ qma_align_model re-run produces a CORRECT .4k now — no manual intervention.
 
 State: model decode fixed + verified (mini: "a city known for its art and
 culture"; agent: "Hello! How can I help you today?"), Q4 no regression.
+
+## 2026-08-26 — performance diagnosis (Q2 2.5 tps vs Q4 3.2 tps)
+
+Profile harness (tests/profile, ECACHE_MB=1024, 128-tok prefill, 24-tok decode):
+  Q4: 312 ms/tok (3.2 tps)  |  MoE fetch=215ms/tok  MoE compute=167ms/tok
+  Q2: 393 ms/tok (2.5 tps)  |  MoE fetch=70ms/tok   MoE compute=704ms/tok
+
+Root cause of Q2 being SLOWER despite half the size: **expert decode kernels**.
+- Q4 experts are Q4_K → qma_q8k_gemm_q4k (i8mm SMMLA, token-paired, 128-bit).
+- Q2 experts are IQ2_XS/IQ3_XXS/IQ4_XS → per-row qma_q8k_dot; IQ3_XXS kernel
+  does 8 weights/iteration with 64-bit vld1 (4x fewer weights/cycle).
+- ecache hit rate ~87% both; Q2 fetch is 3x FASTER (smaller records).
+
+Planned fixes (user's architecture):
+1. MTP speculative decode (Q2 blk.40 head grafted; verify batched).
+2. Tiered expert serving: Q4 for hot/hits (fast GEMM), Q2 slab for cold
+   misses (smaller fetch). Expected compute: 87%*167 + 13%*704 = ~237ms vs 704.
+3. Also: widen the IQ2_XS/IQ3_XXS/IQ4_XS q8k kernels (16-32 weights/iter).
+
+## 2026-08-26 — kernel widening + tiered plan
+
+IQ3_XXS q8k widened 8→32 weights/iter (parity rel 1.6e-7). Q2 tps 2.5→2.6.
+Remaining gap: IQ2_XS/IQ3_XXS/IQ4_XS per-row dots do 2 vdotq per 32 weights
++ table lookups vs Q4_K's 1 vdotq direct — ~2x per-weight; plus gate/up
+dominate (78 IQ2_XS tensors). Tiered serving (Q4 hits + Q2 misses) is the
+direct fix: 87%*fast + 13%*slow. MTP (spec decode) is the throughput multiplier.
