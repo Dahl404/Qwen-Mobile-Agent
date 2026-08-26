@@ -20,13 +20,6 @@ int main(int argc, char **argv) {
     static qma_t m;
     char err[256];
     if (qma_load(&m, model, err, sizeof(err)) != 0) { fprintf(stderr, "load: %s\n", err); return 1; }
-    const char *auxp = getenv("QMA_AUX");
-    if (auxp && auxp[0]) {
-        static qma_aux_t aux;
-        if (qma_load_aux(&aux, auxp, err, sizeof(err)) != 0) { fprintf(stderr, "aux: %s\n", err); return 1; }
-        m.aux = &aux;
-        fprintf(stderr, "[tiered] aux=%s\n", auxp);
-    }
     runstate_t rs;
     if (runstate_init(&rs, 16384) != 0) return 1;
     qma_prefetch_init(&m);

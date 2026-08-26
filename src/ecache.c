@@ -105,7 +105,7 @@ static void *eio_worker(void *p)
 
         pthread_mutex_lock(&io->mu);
         c->slot[j.slot].state = rc == 0 ? (uint8_t)EC_READY : (uint8_t)EC_FAILED;
-        c->slot[j.slot].src = (j.src && c->fetch_q2) ? 1 : 0;
+
         pthread_cond_broadcast(&io->done);
         pthread_mutex_unlock(&io->mu);
     }
@@ -473,11 +473,7 @@ const uint8_t *qma_ecache_get(qma_ecache *c, int layer, int expert,
     }
 
     /* Not resident and not hinted: read it here, but still through a slot,
-     * so a reader thread cannot pick the same one meanwhile. Tiered mode
-     * (fetch_q2 set): the runtime miss is the expensive path (unpredicted
-     * expert), so fill it with the lighter Q2 slab — half the bytes, and
-     * the worker decodes with the Q2 types. The slot is tagged src=1 so
-     * the decode picks the right slab split + quant types. */
+     * so a reader thread cannot pick the same one meanwhile. */
     const int vi = ec_victim(c);
     if (vi < 0) { ec_unlock(c); return NULL; }
     ec_claim(c, vi, key, 0);
@@ -486,8 +482,7 @@ const uint8_t *qma_ecache_get(qma_ecache *c, int layer, int expert,
 
     ec_prof_init();
     double t0 = 0; if (g_ec_prof) t0 = ec_now_s();
-    const int rc = c->fetch_q2 ? c->fetch_q2(user, layer, expert, dst)
-                               : fetch(user, layer, expert, dst);
+    const int rc = fetch(user, layer, expert, dst);
     if (g_ec_prof) { g_ec_sync_ms += (ec_now_s()-t0)*1000.0; g_ec_sync_cnt++; }
 
     ec_lock(c);
@@ -496,7 +491,6 @@ const uint8_t *qma_ecache_get(qma_ecache *c, int layer, int expert,
         ec_unlock(c);
         return NULL;
     }
-    c->slot[vi].src = c->fetch_q2 ? 1 : 0;
     c->slot[vi].state = EC_READY;
     c->last_used = vi;
     if (c->io) pthread_cond_broadcast(&c->io->done);
@@ -547,16 +541,3 @@ void qma_ecache_clear(qma_ecache *c)
     ec_unlock(c);
 }
 
-/* return the source tag (0 = Q4 primary, 1 = Q2 degraded) of the resident
-   slot for (layer, expert); -1 if not resident */
-int qma_ecache_src(const qma_ecache *c, int layer, int expert)
-{
-    const int32_t key = ec_key(layer, expert);
-    int rc = -1;
-    ec_lock((qma_ecache *)c);
-    int si = ec_lookup((qma_ecache *)c, key);
-    if (si >= 0 && c->slot[si].state == EC_READY)
-        rc = c->slot[si].src == 0 ? 0 : 1;   /* 1 and 2 both decode as Q2 */
-    ec_unlock((qma_ecache *)c);
-    return rc;
-}

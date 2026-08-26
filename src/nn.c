@@ -890,10 +890,6 @@ static void moe_xpar_worker(void *arg, int b, int e)
         const size_t dn = (size_t)N_EMBD * N_FF_EXP *
             qma_blk_size(m->layers[il].t_down_exps) / QK_K;
         const uint8_t *ge = NULL, *ue = NULL, *de = NULL;
-        /* per-record types: primary (Q4) unless the slot holds a Q2 slab */
-        uint32_t gt = m->layers[il].t_gate_exps;
-        uint32_t ut = m->layers[il].t_up_exps;
-        uint32_t dt = m->layers[il].t_down_exps;
         double tf = now_s();
         if (m->mmap_exps) {
             /* zero-copy: point the matmul directly at the mapped file pages.
@@ -935,27 +931,9 @@ static void moe_xpar_worker(void *arg, int b, int e)
             }
             g_moe_fetch_us += (now_s() - tf) * 1e6;
             g_moe_fetched += 1;
-            /* tiered mode: a runtime miss fills the slot with the Q2 slab
-               (smaller). Split the record with the Q2 sizes and decode with
-               the Q2 types when the slot says src=1. The types are LOCAL
-               (never mutate the shared per-layer table from worker threads). */
-            if (m->ecache.fetch_q2 && qma_ecache_src(&m->ecache, il, ex) == 1) {
-                const qma_aux_t *a = m->aux;
-                const size_t g2 = (size_t)N_EMBD * N_FF_EXP *
-                    qma_blk_size(a->exps[il].t_gate_exps) / QK_K;
-                const size_t u2 = (size_t)N_EMBD * N_FF_EXP *
-                    qma_blk_size(a->exps[il].t_up_exps) / QK_K;
-                ge = rec;
-                ue = rec + g2;
-                de = rec + g2 + u2;
-                gt = a->exps[il].t_gate_exps;
-                ut = a->exps[il].t_up_exps;
-                dt = a->exps[il].t_down_exps;
-            } else {
-                ge = rec;
-                ue = rec + ge_bytes;
-                de = rec + ge_bytes + ue_bytes;
-            }
+            ge = rec;
+            ue = rec + ge_bytes;
+            de = rec + ge_bytes + ue_bytes;
         }
         double tc = now_s();
         if (xa->q8k) {
@@ -976,7 +954,8 @@ static void moe_xpar_worker(void *arg, int b, int e)
                 }
             }
             moe_expert_one_q8k(ge, ue, de,
-                               gt, ut, dt,
+                               m->layers[il].t_gate_exps, m->layers[il].t_up_exps,
+                               m->layers[il].t_down_exps,
                                xa->xq + (size_t)t * N_EMBD,
                                xa->xd + (size_t)t * (N_EMBD / QK_K),
                                xa->xsum + (size_t)t * (N_EMBD / 16),
@@ -2149,35 +2128,8 @@ static int expert_fetch(void *user, int layer, int expert, uint8_t *dst)
     return 0;
 }
 
-/* ---- tiered (Q2 degraded) expert fetch ----
- * Same record shape as expert_fetch but reads the Q2 file's slabs, which
- * are smaller (IQ2_XS/IQ3_XXS/IQ4_XS vs Q4_K/Q6_K). The qma_aux_t holds the
- * per-layer Q2 types + abs offsets. Used for the runtime (unpredicted) miss
- * path: half the bytes read, and the worker decodes with the Q2 types. */
-static void aux_slab_bytes(const qma_aux_t *a, int il,
-                           size_t *ge, size_t *ue, size_t *dn) {
-    const size_t slab = (size_t)N_EMBD * N_FF_EXP;
-    *ge = slab * qma_blk_size(a->exps[il].t_gate_exps) / QK_K;
-    *ue = slab * qma_blk_size(a->exps[il].t_up_exps) / QK_K;
-    *dn = slab * qma_blk_size(a->exps[il].t_down_exps) / QK_K;
-}
-
-static int expert_fetch_q2(void *user, int layer, int expert, uint8_t *dst)
-{
-    qma_t *m = (qma_t *)user;
-    if (!m->aux || layer < 0 || layer >= N_LAYER || expert < 0 || expert >= N_EXPERT)
-        return -1;
-    const qma_aux_t *a = m->aux;
-    if (a->fd < 0) return -1;
-    size_t ge, ue, dn; aux_slab_bytes(a, layer, &ge, &ue, &dn);
-    if (pread_all(a->fd, dst, ge, a->exps[layer].off_gate_exps + (size_t)expert * ge) != 0)
-        return -1;
-    if (pread_all(a->fd, dst + ge, ue, a->exps[layer].off_up_exps + (size_t)expert * ue) != 0)
-        return -1;
-    if (pread_all(a->fd, dst + ge + ue, dn, a->exps[layer].off_down_exps + (size_t)expert * dn) != 0)
-        return -1;
-    return 0;
-}
+/* Arm the expert cache: budget bytes across the whole model, reader
+   threads. Call after load, once. budget 0 or nthreads 0 = off. */
 void qma_ecache_arm(qma_t *m, size_t budget_bytes, int nthreads)
 {
     size_t rec = 0;
@@ -2186,11 +2138,6 @@ void qma_ecache_arm(qma_t *m, size_t budget_bytes, int nthreads)
         if (r > rec) rec = r;
     }
     if (qma_ecache_init(&m->ecache, budget_bytes, rec, 0) != 0) return;
-    /* tiered mode: the runtime (sync) miss reads the Q2 slab — smaller, and
-       the worker decodes it with the Q2 types. Hints/prefetch still fill
-       with the primary (Q4) record. */
-    if (m->aux && m->aux->fd >= 0)
-        m->ecache.fetch_q2 = expert_fetch_q2;
     if (m->ecache.n_slots > 0) {
         if (qma_ecache_io_start(&m->ecache, expert_fetch, m, nthreads,
                                    nthreads > 0 ? 8 : 0) != 0)

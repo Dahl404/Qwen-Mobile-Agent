@@ -43,19 +43,8 @@ int main(int argc, char **argv) {
     if (qma_load(&m, model, err, sizeof(err)) != 0) {
         fprintf(stderr, "load failed: %s\n", err); return 1;
     }
-    /* tiered mode: QMA_AUX=<q2 path> loads the secondary source; runtime
-       expert misses then fill from the Q2 slab (smaller/faster) */
-    const char *auxp = getenv("QMA_AUX");
-    if (auxp && auxp[0]) {
-        static qma_aux_t aux;
-        if (qma_load_aux(&aux, auxp, err, sizeof(err)) != 0) {
-            fprintf(stderr, "aux load failed: %s\n", err); return 1;
-        }
-        m.aux = &aux;
-        fprintf(stderr, "tiered mode: aux=%s\n", auxp);
-    }
-    size_t eb = getenv("QMA_ECMB") ? (size_t)atoi(getenv("QMA_ECMB")) << 20 : 1024ull << 20;
-    qma_ecache_arm(&m, eb, 4);
+    /* arm the expert cache like the real engine (io threads on) */
+    qma_ecache_arm(&m, 1024ull * 1024 * 1024, 4);
     qma_prefetch_init(&m);
 
     runstate_t rs;
