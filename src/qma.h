@@ -436,6 +436,7 @@ int      qma_kvq_on(void);
    without re-prefilling the prompt. KV itself lives in the mapped file.
    Returns 0 ok. */
 int      runstate_save(runstate_t *rs, const char *path);
+int      runstate_checkpoint(runstate_t *rs, const char *state_path);
 int      runstate_load(runstate_t *rs, const char *path);
 /* HCM salience + heavy-hitter arena persistence (restart survival) */
 int      hcm_save(const char *path);

@@ -418,6 +418,28 @@ static void session_save(void) {
 
 static void session_wipe_files(void);   /* fwd (defined below) */
 
+/* ---- checkpointing ----
+ * After every completed response AND every CHECKPOINT_EVERY tokens inside
+ * a generation (whichever comes first), persist the full context to disk
+ * and REPLACE the previous checkpoint. A crash mid-operation then loses at
+ * most the in-flight response, never the whole session.
+ *   kv.bin   — file-backed attention KV (fsync'd; MAP_SHARED dirty pages)
+ *   state.bin — GDN recurrent state + n_pos (atomic tmp+rename)
+ *   salience.bin — HCM salience/archive arena (pinned facts)
+ */
+#define CHECKPOINT_EVERY 256   /* tokens between mid-generation checkpoints */
+static long g_since_checkpoint = 0;
+
+static void session_checkpoint(void) {
+    if (!g_session_dir[0] || !g_rs_ready) return;
+    char p[1200];
+    snprintf(p, sizeof(p), "%s/state.bin", g_session_dir);
+    runstate_checkpoint(&g_rs, p);   /* fsync kv.bin + atomic state.bin */
+    snprintf(p, sizeof(p), "%s/salience.bin", g_session_dir);
+    hcm_save(p);                     /* persist pinned facts (best-effort) */
+    g_since_checkpoint = 0;
+}
+
 /* ---- self-hosting: mount the embedded internal tree ---- */
 static void mkdirs(const char *path);   /* defined below (session helpers) */
 static void intern_init(void) {
@@ -596,6 +618,7 @@ static void session_wipe_files(void) {
 
 static void session_reset(void) {
     if (!g_session_dir[0]) return;
+    g_since_checkpoint = 0;
     runstate_free(&g_rs);
     session_wipe_files();
     char kv_path[1200];
@@ -937,6 +960,11 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
     if (qma_eval(m, &g_rs, ids, nids, logits, g_threads, g_prefetch, 0) != 0) {
         free(res->content); free(ids); free(logits); return -1;
     }
+    /* checkpoint after the user-turn prefill (a long paste is a multi-minute
+       window with no decode loop — don't lose it to a crash) */
+    g_since_checkpoint += nids;
+    if (g_since_checkpoint >= CHECKPOINT_EVERY)
+        session_checkpoint();
     double t_pre1 = now_s2();
     apply_eos_penalty(m, logits);
 
@@ -1187,7 +1215,12 @@ static int agent_generate(qma_t *m, const char *prompt, int enable_thinking,
         if (qma_eval(m, &g_rs, &id, 1, logits, g_threads, g_prefetch, 0) != 0) break;
         apply_eos_penalty(m, logits);
         ngen++;
+        /* mid-generation checkpoint: every CHECKPOINT_EVERY tokens */
+        if (++g_since_checkpoint >= CHECKPOINT_EVERY)
+            session_checkpoint();
     }
+    /* response complete: checkpoint (replaces the last mid-gen one) */
+    session_checkpoint();
     c_reset();
     flush_piece();
 
@@ -1765,6 +1798,49 @@ void agent_memory_restore(void) {
     mem_free(ent, n);
 }
 
+/* ---- /compact: programmatic context compaction (pi-vcc style) ----
+ * One cheap generation: the model distills the conversation into structured
+ * memory.json entries (goal, decisions, files, outstanding) via memory_write.
+ * Then the KV is hard-reset and re-ingested as system prompt + memory archive.
+ * The memory archive is always-attended, so the summary survives — same
+ * effect as pi's "firstKeptEntryId" boundary, but programmatic (no long
+ * re-read, no external summarizer). */
+static void cmd_compact(void) {
+    if (!g_rs_ready) { fprintf(stderr, "qma: model not ready\n"); return; }
+    fprintf(stderr, "qma: compacting — distilling context into memory.json...\n");
+    const char *instr =
+        "Perform a context compaction. Read the ENTIRE conversation above and "
+        "distill it into persistent memory entries using memory_write. Use these "
+        "keys: goal (the user's current objective), decisions (key "
+        "decisions/constraints made so far), files (paths touched and what "
+        "was changed in each), context (anything still relevant: open "
+        "questions, next steps, unresolved issues). Be CONCISE but complete  "
+        "capture everything needed to continue this task from scratch. Then "
+        "reply with only: COMPACTED.<|im_end|>";
+    /* append the instruction as a normal user turn — the KV already holds
+       the full conversation, so the model distills from its real context */
+    static char delta[262144];
+    build_user_delta(delta, sizeof(delta), instr);
+    gen_result_t res;
+    memset(&res, 0, sizeof(res));
+    int gr = agent_generate(&g_model, delta, 1, &res);
+    if (gr != 0) {
+        fprintf(stderr, "qma: compact generation failed (%d)\n", gr);
+    } else {
+        /* the model called memory_write during the turn — entries are in
+           memory.json now. Free the response. */
+        fprintf(stderr, "qma: distillation done, resetting context...\n");
+    }
+    if (res.content) free(res.content);
+    if (res.calls) free(res.calls);
+    /* hard reset: wipe KV + GDN state + salience, fresh runstate */
+    session_reset();
+    fprintf(stderr, "qma: context wiped — re-ingesting system prompt + memory...\n");
+    ingest_system_prompt();
+    agent_memory_restore();
+    fprintf(stderr, "qma: compacted (n_pos=%d, memory archive restored)\n", g_rs.n_pos);
+}
+
 /* ---- main ---- */
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -2016,6 +2092,10 @@ int main(int argc, char **argv) {
         while (ll > 0 && (line[ll-1] == '\n' || line[ll-1] == '\r')) line[--ll] = 0;
         if (ll == 0) continue;
         if (strcmp(line, "/exit") == 0 || strcmp(line, "/quit") == 0) break;
+        if (strcmp(line, "/compact") == 0 || strcmp(line, "/compact all") == 0) {
+            cmd_compact();
+            continue;
+        }
         if (strcmp(line, "/reset") == 0 || strcmp(line, "/clear") == 0) {
             session_reset();
             fprintf(stderr, "qma: context wiped — ingesting system prompt…\n");

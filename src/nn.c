@@ -2564,6 +2564,37 @@ int runstate_save(runstate_t *rs, const char *path) {
     return 0;
 }
 
+/* checkpoint: flush the file-backed KV (mmap MAP_SHARED dirty pages) to
+ * disk, then atomically write the recurrent state. The KV file is the
+ * bulk of the context (it grows with n_ctx); fsync makes a crash lose at
+ * most the tokens since the last checkpoint instead of everything.
+ * state is written to path.tmp then renamed over path so a crash
+ * mid-write never leaves a torn file (old checkpoint stays valid). */
+int runstate_checkpoint(runstate_t *rs, const char *state_path) {
+    int rc = 0;
+    /* flush the mmap'd KV: msync with MS_SYNC, then fsync the fd so the
+       file's metadata (size, blocks) is durable too. */
+    if (rs->kv_fd >= 0 && rs->kv_map && rs->kv_map_len > 0) {
+        if (msync(rs->kv_map, rs->kv_map_len, MS_SYNC) != 0) rc = -1;
+        if (fsync(rs->kv_fd) != 0) rc = -1;
+    }
+    /* atomic state write: tmp + rename */
+    if (state_path && state_path[0]) {
+        char tmp[1200];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", state_path);
+        if (runstate_save(rs, tmp) != 0) return -1;
+        if (rename(tmp, state_path) != 0) { unlink(tmp); return -1; }
+        /* fsync the containing dir so the rename is durable */
+        char dir[1200];
+        snprintf(dir, sizeof(dir), "%s", state_path);
+        char *slash = strrchr(dir, '/');
+        if (slash) { *slash = 0; int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+            if (dfd >= 0) { fsync(dfd); close(dfd); } }
+    }
+    return rc;
+}
+
+
 int runstate_load(runstate_t *rs, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
