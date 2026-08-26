@@ -64,9 +64,14 @@
 #define N_ATTN_LAYER  10
 
 /* ---------- quant type constants ---------- */
-#define GGML_TYPE_F32  0
-#define GGML_TYPE_Q4_K 12
-#define GGML_TYPE_Q6_K 14
+#define GGML_TYPE_F32   0
+#define GGML_TYPE_Q4_K  12
+#define GGML_TYPE_Q5_K  13
+#define GGML_TYPE_Q6_K  14
+#define GGML_TYPE_Q3_K  11
+#define GGML_TYPE_IQ2_XS 17
+#define GGML_TYPE_IQ2_S  23
+#define GGML_TYPE_Q8_0   8
 
 /* Q4_K: 256 weights per super-block, 8 sub-blocks of 32, 6-bit scales.
  * weight = (q + b) * d, with per-sub-block scale/mins packed in 6 bits.
@@ -92,6 +97,60 @@ typedef struct {
 /* q8_0: fp16 scale + 32 int8 (activation quant) */
 #define QK8_0 32
 typedef struct { uint16_t d; int8_t qs[QK8_0]; } block_q8_0;
+
+/* Q5_K: Q4_K layout + 1 extra high bit per weight (qh).
+ * weight = d*sc*q - dmin*m, q in [0,31]. 176 B / 256 w. */
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[K_SCALE_SIZE];
+    uint8_t  qh[QK_K/8];          /* high bit of each weight */
+    uint8_t  qs[QK_K/2];          /* low 4 bits */
+} block_q5_K;
+
+/* Q3_K: 16 groups of 16, weight = d*(sc-32)*(q - 4*[high bit clear]),
+ * q in [0,3] from 2-bit fields + hmask high bits. 110 B / 256 w. */
+typedef struct {
+    uint8_t  hmask[QK_K/8];       /* high bit per weight (bit g -> lanes) */
+    uint8_t  qs[QK_K/4];          /* low 2 bits, 4 fields per byte */
+    uint8_t  scales[12];          /* 6-bit, shuffled layout (see kernel) */
+    uint16_t d;
+} block_q3_K;
+
+/* IQ2_XS: codebook quants. Per 256 w: 8 x 32-lane groups, each group has
+ * one scale byte (lo nibble -> first 16 lanes' db, hi nibble -> last 16)
+ * and four u16 entries; low 9 bits index iq2xs_grid (8 bytes), bits 9-15
+ * index ksigns_iq2xs for the sign of each of those 8 weights.
+ * weight = d*(0.5+sc)*0.25 * grid[j] * sign. 74 B / 256 w. */
+typedef struct {
+    uint16_t d;
+    uint16_t qs[QK_K/8];          /* 32 grid+sign indices */
+    uint8_t  scales[QK_K/32];     /* 8 scale bytes */
+} block_iq2_xs;
+
+/* IQ2_S: like IQ2_XS but grid index is 10-bit (qs low 8b + 2 bits from qh),
+ * signs stored as plain bytes. 82 B / 256 w. */
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[QK_K/4];          /* [0..31] grid idx lo, [32..63] signs */
+    uint8_t  qh[QK_K/32];         /* grid idx bits 8-9, packed */
+    uint8_t  scales[QK_K/32];
+} block_iq2_s;
+
+/* byte size of one QK_K super-block of a supported weight type
+ * (0 = unsupported). Single source of truth — all row/slab math routes
+ * through this so mixed-quant models stay consistent. */
+static inline size_t qma_blk_size(int type) {
+    switch (type) {
+    case GGML_TYPE_Q4_K:  return sizeof(block_q4_K);   /* 144 */
+    case GGML_TYPE_Q5_K:  return sizeof(block_q5_K);   /* 176 */
+    case GGML_TYPE_Q6_K:  return sizeof(block_q6_K);   /* 210 */
+    case GGML_TYPE_Q3_K:  return sizeof(block_q3_K);   /* 110 */
+    case GGML_TYPE_IQ2_XS:return sizeof(block_iq2_xs); /* 74  */
+    case GGML_TYPE_IQ2_S: return sizeof(block_iq2_s);  /* 82  */
+    default:              return 0;
+    }
+}
 
 /* ---------- fp16 helpers ---------- */
 /* ARM64 converts fp16<->fp32 in a single FCVT instruction. The portable
@@ -359,8 +418,16 @@ uint64_t qma_hash64(const void *data, size_t len);
 /* q4_k dot with q8_0 activation: s = sum over k of W[k] * y[k] */
 void     dequantize_row_q4_K(const block_q4_K *x, float *y, int64_t k);
 void     dequantize_row_q6_K(const block_q6_K *x, float *y, int64_t k);
+void     dequantize_row_q5_K(const block_q5_K *x, float *y, int64_t k);
+void     dequantize_row_q3_K(const block_q3_K *x, float *y, int64_t k);
+void     dequantize_row_iq2_xs(const block_iq2_xs *x, float *y, int64_t k);
+void     dequantize_row_iq2_s(const block_iq2_s *x, float *y, int64_t k);
 float    dot_q4_K_f32(const block_q4_K *W, const float *x, int n);
 float    dot_q6_K_f32(const block_q6_K *W, const float *x, int n);
+float    dot_q5_K_f32(const block_q5_K *W, const float *x, int n);
+float    dot_q3_K_f32(const block_q3_K *W, const float *x, int n);
+float    dot_iq2_xs_f32(const block_iq2_xs *W, const float *x, int n);
+float    dot_iq2_s_f32(const block_iq2_s *W, const float *x, int n);
 
 /* quantize row of floats to q8_0 blocks (k must be multiple of 32) */
 void     quantize_row_q8_0(const float *x, block_q8_0 *y, int64_t k);
@@ -371,6 +438,15 @@ int      qma_q8k_available(void);
 void     qma_q8k_quant(const float *x, int n, int8_t *xq, float *xd, int16_t *xsum);
 float    qma_q8k_dot(const void *row, int wtype, const int8_t *xq,
                         const float *xd, const int16_t *xsum, int n);
+/* new-type SDOT kernels (qkerns.c); xsum unused by Q3_K/IQ2 (no bias) */
+float    qma_dot_q5_K_q8k(const block_q5_K *b, const int8_t *xq,
+                          const float *xd, const int16_t *xsum, int n);
+float    qma_dot_q3_K_q8k(const block_q3_K *b, const int8_t *xq,
+                          const float *xd, int n);
+float    qma_dot_iq2_xs_q8k(const block_iq2_xs *b, const int8_t *xq,
+                            const float *xd, int n);
+float    qma_dot_iq2_s_q8k(const block_iq2_s *b, const int8_t *xq,
+                           const float *xd, int n);
 /* fused gate+up: two Q4_K rows, one pass over the shared activation */
 void     qma_q8k_gateup(const void *g, const void *u, const int8_t *xq,
                            const float *xd, const int16_t *xsum, int n,
