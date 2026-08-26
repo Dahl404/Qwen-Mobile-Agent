@@ -586,6 +586,119 @@ void qma_free(qma_t *m) {
     memset(m, 0, sizeof(*m));
 }
 
+/* ---------------- secondary (Q2) weight source ----------------
+ * Tiered expert serving + MTP head come from a second GGUF (the Q2 file).
+ * Expert indexing is identical to the primary (verified: same names/dims).
+ * This resolves ONLY what tiered/MTP needs: per-layer Q2 expert types +
+ * abs offsets, and the blk.40 (MTP) tensor pointers. Header-only parse,
+ * data section mmap'd (expert slabs are pread'd by the ecache via aux fd). */
+int qma_load_aux(qma_aux_t *a, const char *path, char *err, size_t errlen) {
+    memset(a, 0, sizeof(*a));
+    a->fd = -1;
+    a->fd = open(path, O_RDONLY);
+    if (a->fd < 0) { snprintf(err, errlen, "cannot open %s", path); return -1; }
+    struct stat st;
+    if (fstat(a->fd, &st) != 0 || st.st_size < 16) {
+        snprintf(err, errlen, "cannot stat %s", path); return -1;
+    }
+    a->map_size = (size_t)st.st_size;
+    a->map = mmap(NULL, a->map_size, PROT_READ, MAP_SHARED, a->fd, 0);
+    if (a->map == MAP_FAILED) { snprintf(err, errlen, "mmap %s", path); return -1; }
+    reader_t r = { a->map, a->map + a->map_size, 0 };
+    if (memcmp(r.p, "GGUF", 4) != 0) { snprintf(err, errlen, "not a GGUF"); return -1; }
+    r.p += 4;
+    rd_u32(&r);
+    uint64_t n_tensors = rd_u64(&r), n_kv = rd_u64(&r);
+    size_t alignment = 32;
+    for (uint64_t i = 0; i < n_kv && !r.err; i++) {
+        size_t klen; const uint8_t *key = rd_str(&r, &klen);
+        uint32_t t = rd_u32(&r);
+        if (r.err) break;
+        if (klen == 17 && memcmp(key, "general.alignment", 17) == 0) {
+            if (t == 4) alignment = rd_u32(&r);
+            else if (t == 10 || t == 11) alignment = (size_t)rd_u64(&r);
+            else rd_skip_val(&r, t);
+        } else rd_skip_val(&r, t);
+    }
+    if (r.err) { snprintf(err, errlen, "corrupt metadata"); return -1; }
+    if (n_tensors > (1u << 20)) { snprintf(err, errlen, "absurd tensor count"); return -1; }
+    a->n_tensors = (uint32_t)n_tensors;
+    a->tensors = malloc(sizeof(tensor_t) * n_tensors);
+    if (!a->tensors) { snprintf(err, errlen, "oom"); return -1; }
+    for (uint64_t i = 0; i < n_tensors && !r.err; i++) {
+        tensor_t *t = &a->tensors[i];
+        size_t nlen; const uint8_t *nm = rd_str(&r, &nlen);
+        size_t cl = nlen < sizeof(t->name) - 1 ? nlen : sizeof(t->name) - 1;
+        memcpy(t->name, nm, cl); t->name[cl] = 0;
+        uint32_t nd = rd_u32(&r);
+        int64_t dims[3] = {1, 1, 1};
+        for (uint32_t d = 0; d < nd && d < 3 && !r.err; d++) dims[d] = (int64_t)rd_u64(&r);
+        for (uint32_t d = 3; d < nd && !r.err; d++) rd_u64(&r);
+        t->type = rd_u32(&r);
+        t->off  = (size_t)rd_u64(&r);
+        t->ne[0] = dims[0]; t->ne[1] = dims[1]; t->ne[2] = dims[2];
+        t->nbytes = 0;
+    }
+    if (r.err) { snprintf(err, errlen, "corrupt tensor info"); return -1; }
+    {
+        uintptr_t p = (uintptr_t)r.p;
+        size_t pad = (size_t)((alignment - (p % alignment)) % alignment);
+        r.p += pad;
+    }
+    a->data = (uint8_t *)r.p;
+    a->data_section_abs = (size_t)(a->data - a->map);
+
+    /* resolve what we need by name (linear scan, same as primary loader) */
+    #define AUX_FIND(dst, nm) do { \
+        dst = NULL; \
+        for (uint32_t i = 0; i < a->n_tensors; i++) \
+            if (strcmp(a->tensors[i].name, nm) == 0) \
+                { dst = a->data + a->tensors[i].off; break; } \
+    } while (0)
+    #define AUX_FIND_TOFF(tt, offp, nm) do { \
+        tt = 0; offp = 0; \
+        for (uint32_t i = 0; i < a->n_tensors; i++) \
+            if (strcmp(a->tensors[i].name, nm) == 0) \
+                { tt = a->tensors[i].type; \
+                  offp = a->data_section_abs + a->tensors[i].off; break; } \
+    } while (0)
+    char nm[96];
+    for (int il = 0; il < N_LAYER; il++) {
+        snprintf(nm, sizeof(nm), "blk.%d.ffn_gate_exps.weight", il);
+        AUX_FIND_TOFF(a->exps[il].t_gate_exps, a->exps[il].off_gate_exps, nm);
+        snprintf(nm, sizeof(nm), "blk.%d.ffn_up_exps.weight", il);
+        AUX_FIND_TOFF(a->exps[il].t_up_exps, a->exps[il].off_up_exps, nm);
+        snprintf(nm, sizeof(nm), "blk.%d.ffn_down_exps.weight", il);
+        AUX_FIND_TOFF(a->exps[il].t_down_exps, a->exps[il].off_down_exps, nm);
+    }
+    AUX_FIND(a->mtp_attn_norm,   "blk.40.attn_norm.weight");
+    AUX_FIND(a->mtp_attn_q,      "blk.40.attn_q.weight");
+    AUX_FIND(a->mtp_attn_k,      "blk.40.attn_k.weight");
+    AUX_FIND(a->mtp_attn_v,      "blk.40.attn_v.weight");
+    AUX_FIND(a->mtp_attn_out,    "blk.40.attn_output.weight");
+    AUX_FIND(a->mtp_attn_q_norm, "blk.40.attn_q_norm.weight");
+    AUX_FIND(a->mtp_attn_k_norm, "blk.40.attn_k_norm.weight");
+    AUX_FIND(a->mtp_post_norm,   "blk.40.post_attention_norm.weight");
+    AUX_FIND(a->mtp_gate_inp,    "blk.40.ffn_gate_inp.weight");
+    AUX_FIND_TOFF(a->t_mtp_gate, a->off_mtp_gate, "blk.40.ffn_gate_exps.weight");
+    AUX_FIND_TOFF(a->t_mtp_up,   a->off_mtp_up,   "blk.40.ffn_up_exps.weight");
+    AUX_FIND_TOFF(a->t_mtp_down, a->off_mtp_down, "blk.40.ffn_down_exps.weight");
+    AUX_FIND(a->mtp_eh_proj,        "blk.40.nextn.eh_proj.weight");
+    AUX_FIND(a->mtp_enorm,          "blk.40.nextn.enorm.weight");
+    AUX_FIND(a->mtp_hnorm,          "blk.40.nextn.hnorm.weight");
+    AUX_FIND(a->mtp_shared_head_norm, "blk.40.nextn.shared_head_norm.weight");
+    #undef AUX_FIND
+    #undef AUX_FIND_TOFF
+    return 0;
+}
+
+void qma_free_aux(qma_aux_t *a) {
+    if (!a) return;
+    if (a->fd >= 0) { munmap(a->map, a->map_size); close(a->fd); }
+    free(a->tensors);
+    memset(a, 0, sizeof(*a));
+}
+
 /* ---------------- one-time model alignment (4K tensor starts) ----------------
  * O_DIRECT expert reads require every tensor's file offset to be 4K-aligned.
  * GGUF writers use alignment=32, so tensor starts drift out of 4K. This

@@ -597,30 +597,26 @@ float qma_dot_iq3_xxs_q8k(const block_iq3_xxs *b, const int8_t *xq,
         const uint8_t *scales_and_signs = qs + QK_K / 4;
         float32x4_t acc = vdupq_n_f32(0.f);
         for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            /* one 32-value sub-block: 4 l's x 8 weights = 32 int8 weights,
+               two 16-lane vdotq per sub-block. */
             uint32_t aux32;
             memcpy(&aux32, scales_and_signs + 4 * ib32, 4);
             const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+            int8_t w[32];
             for (int l = 0; l < 4; ++l) {
-                const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * l) & 127];
+                const uint8_t sgn = ksigns_iq2xs[(aux32 >> 7 * l) & 127];
                 const uint8_t *g1 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 0]);
                 const uint8_t *g2 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 1]);
-                int8_t w[8];   /* exactly 8 weights per l */
                 for (int j = 0; j < 4; ++j) {
-                    w[j]     = (int8_t)(signs & kmask_iq2xs[j + 0] ? -g1[j] : g1[j]);
-                    w[j + 4] = (int8_t)(signs & kmask_iq2xs[j + 4] ? -g2[j] : g2[j]);
+                    w[8 * l + j]     = (int8_t)(sgn & kmask_iq2xs[j + 0] ? -g1[j] : g1[j]);
+                    w[8 * l + j + 4] = (int8_t)(sgn & kmask_iq2xs[j + 4] ? -g2[j] : g2[j]);
                 }
-                /* 64-bit loads: read exactly 8 bytes, zero-pad to 128-bit
-                   lanes. A 128-bit load here would read 8 bytes past the
-                   row's final block (activation buffers are 256-aligned
-                   per block, not padded after the last block). */
-                int8x8_t wv = vld1_s8(w);
-                int8x8_t xv = vld1_s8(xp);
-                int32x4_t p = vdotq_s32(vdupq_n_s32(0),
-                                        vcombine_s8(wv, vdup_n_s8(0)),
-                                        vcombine_s8(xv, vdup_n_s8(0)));
-                acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p), db * xdb);
-                xp += 8;
             }
+            int32x4_t p0 = vdotq_s32(vdupq_n_s32(0), vld1q_s8(w),     vld1q_s8(xp));
+            int32x4_t p1 = vdotq_s32(vdupq_n_s32(0), vld1q_s8(w + 16), vld1q_s8(xp + 16));
+            acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p0), db * xdb);
+            acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p1), db * xdb);
+            xp += 32;
             qs += 8;
         }
         total += vaddvq_f32(acc);
