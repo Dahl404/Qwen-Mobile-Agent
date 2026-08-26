@@ -42,6 +42,7 @@ typedef struct {
     uint8_t  state;      /* one of the EC_* above                           */
     uint8_t  fresh;      /* read was issued for this batch: not a hit yet   */
     uint8_t  birth;      /* how this slot was claimed: 0 spec, 1 hint, 2 sync */
+    uint8_t  src;        /* 0 = primary (Q4) record, 1 = degraded (Q2)      */
     uint32_t hits;       /* LFRU frequency term                             */
     uint64_t last;       /* LFRU recency term                               */
     uint64_t pin;        /* hint generation holding it; 0 = evictable       */
@@ -71,6 +72,7 @@ typedef struct {
     struct qma_eio *io;
     qma_fetch_fn fetch;
     void *fetch_user;
+    qma_fetch_fn fetch_q2;   /* lighter degraded read (Q2 slab) on sync miss */
     int depth;                       /* reads kept in flight               */
     uint64_t pf_gen;                 /* current hint generation, never 0   */
     int pf_ids[EC_PF_MAX];
@@ -94,6 +96,10 @@ void qma_ecache_clear(qma_ecache *c);
  * NULL on failure. */
 const uint8_t *qma_ecache_get(qma_ecache *c, int layer, int expert,
                                  qma_fetch_fn fetch, void *user);
+
+/* 0 = slot holds the primary (Q4) record, 1 = degraded (Q2). Meaningful
+   only for the record returned by the most recent get()/hold(). */
+int      qma_ecache_src(const qma_ecache *c, int layer, int expert);
 
 /* get(), except the record stays claimed after the next one is asked for
  * (a caller handing k records to k threads needs all of them to outlive

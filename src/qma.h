@@ -261,6 +261,44 @@ typedef struct {
 } tensor_t;
 
 /* ---------- model ---------- */
+typedef struct qma_aux_s qma_aux_t;   /* fwd: full def before qma_t below */
+
+
+/* Load a secondary GGUF for tiered experts + MTP head. Resolves only what
+   the tiered/MTP paths need; NULL weight = not present/needed. Returns 0 ok. */
+int      qma_load_aux(qma_aux_t *a, const char *path, char *err, size_t errlen);
+void     qma_free_aux(qma_aux_t *a);
+
+/* ---------- secondary (Q2) weight source for tiered expert serving ----------
+ * The Q2 file (UD-Q2_K_XL) has the SAME expert indexing as the Q4 file
+ * (verified: 733 shared tensors, byte-identical names+dims). Tiered serving
+ * keeps the Q4 file as primary (fast i8mm decode) and serves the smaller Q2
+ * expert slab on cold misses. The Q2 file also carries the MTP head (blk.40)
+ * for speculative decoding — the Q4 file has no blk.40. */
+struct qma_aux_s {
+    int fd;
+    uint8_t *map;
+    size_t map_size;
+    uint8_t *data;              /* tensor data section start (in map) */
+    size_t data_section_abs;    /* abs file offset of data section */
+    uint32_t n_tensors;
+    tensor_t *tensors;
+    /* per-layer Q2 expert types + abs offsets (same slab layout as primary) */
+    struct {
+        uint32_t t_gate_exps, t_up_exps, t_down_exps;
+        size_t   off_gate_exps, off_up_exps, off_down_exps;
+    } exps[N_LAYER];
+    /* MTP head (blk.40) — resolved by name for the spec-decode path */
+    uint8_t *mtp_attn_norm, *mtp_attn_q, *mtp_attn_k, *mtp_attn_v;
+    uint8_t *mtp_attn_out, *mtp_attn_q_norm, *mtp_attn_k_norm;
+    uint8_t *mtp_post_norm, *mtp_gate_inp, *mtp_gate_exps, *mtp_up_exps;
+    uint8_t *mtp_down_exps, *mtp_eh_proj, *mtp_enorm, *mtp_hnorm;
+    uint8_t *mtp_shared_head_norm;
+    uint32_t t_mtp_gate, t_mtp_up, t_mtp_down, t_mtp_eh;
+    /* abs file offsets of the MTP expert tensors (pread by spec-decode) */
+    size_t   off_mtp_gate, off_mtp_up, off_mtp_down;
+};
+
 typedef struct {
     /* mmap */
     int      fd;
@@ -324,6 +362,11 @@ typedef struct {
         int mmap_exps;   /* experts read zero-copy via m->data (no ecache) */         /* cache armed (budget > 0) */
     size_t data_section_abs; /* absolute file offset of the data section */
 
+    /* tiered expert serving: optional secondary (Q2) weight source. When
+       loaded, runtime expert misses fill from it (smaller records) and the
+       MTP head comes from it too. */
+    qma_aux_t *aux;
+
     /* tokenizer */    int      n_vocab;
     char    *tok_text[N_VOCAB];   /* byte-encoded token strings */
     uint8_t  tok_type[N_VOCAB];   /* llama token attr */
@@ -349,43 +392,6 @@ typedef struct {
     /* chat template special ids */
     uint32_t id_im_start, id_im_end;
 } qma_t;
-
-/* ---------- secondary (Q2) weight source for tiered expert serving ----------
- * The Q2 file (UD-Q2_K_XL) has the SAME expert indexing as the Q4 file
- * (verified: 733 shared tensors, byte-identical names+dims). Tiered serving
- * keeps the Q4 file as primary (fast i8mm decode) and serves the smaller Q2
- * expert slab on cold misses. The Q2 file also carries the MTP head (blk.40)
- * for speculative decoding — the Q4 file has no blk.40. */
-typedef struct {
-    int fd;
-    uint8_t *map;
-    size_t map_size;
-    uint8_t *data;              /* tensor data section start (in map) */
-    size_t data_section_abs;    /* abs file offset of data section */
-    uint32_t n_tensors;
-    tensor_t *tensors;
-    /* per-layer Q2 expert types + abs offsets (same slab layout as primary) */
-    struct {
-        uint32_t t_gate_exps, t_up_exps, t_down_exps;
-        size_t   off_gate_exps, off_up_exps, off_down_exps;
-    } exps[N_LAYER];
-    /* MTP head (blk.40) — resolved by name for the spec-decode path */
-    uint8_t *mtp_attn_norm, *mtp_attn_q, *mtp_attn_k, *mtp_attn_v;
-    uint8_t *mtp_attn_out, *mtp_attn_q_norm, *mtp_attn_k_norm;
-    uint8_t *mtp_post_norm, *mtp_gate_inp, *mtp_gate_exps, *mtp_up_exps;
-    uint8_t *mtp_down_exps, *mtp_eh_proj, *mtp_enorm, *mtp_hnorm;
-    uint8_t *mtp_shared_head_norm;
-    uint32_t t_mtp_gate, t_mtp_up, t_mtp_down, t_mtp_eh;
-    /* abs file offsets of the MTP expert tensors (pread by spec-decode) */
-    size_t   off_mtp_gate, off_mtp_up, off_mtp_down;
-} qma_aux_t;
-
-/* Load a secondary GGUF for tiered experts + MTP head. Resolves only what
-   the tiered/MTP paths need; NULL weight = not present/needed. Returns 0 ok. */
-int      qma_load_aux(qma_aux_t *a, const char *path, char *err, size_t errlen);
-void     qma_free_aux(qma_aux_t *a);
-
-/* ---------- runtime state ---------- */
 typedef struct {
     /* recurrent state per layer */
     float *conv_state[N_LAYER];   /* [3][10240] */
