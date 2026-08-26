@@ -275,7 +275,11 @@ int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
         switch (t->type) {
         case GGML_TYPE_F32: bs = 4; blk = 1; break;
         case GGML_TYPE_Q4_K: bs = sizeof(block_q4_K); blk = QK_K; break;
+        case GGML_TYPE_Q5_K: bs = sizeof(block_q5_K); blk = QK_K; break;
         case GGML_TYPE_Q6_K: bs = sizeof(block_q6_K); blk = QK_K; break;
+        case GGML_TYPE_Q3_K: bs = sizeof(block_q3_K); blk = QK_K; break;
+        case GGML_TYPE_IQ2_XS: bs = sizeof(block_iq2_xs); blk = QK_K; break;
+        case GGML_TYPE_IQ2_S:  bs = sizeof(block_iq2_s);  blk = QK_K; break;
         default:
             snprintf(err, errlen, "tensor %s: unsupported type %u", t->name, t->type); return -1;
         }
@@ -493,14 +497,13 @@ int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
        (unaligned file or filesystem without O_DIRECT). The file is made
        4K-aligned by qma_align_model() at startup. */
     {
-        const size_t slab = (size_t)N_EMBD * N_FF_EXP;
-        const size_t gu = slab * sizeof(block_q4_K) / QK_K;
         int ok = 1;
         for (int il = 0; il < N_LAYER && ok; il++) {
-            const size_t dn = slab * (m->layers[il].t_down_exps == GGML_TYPE_Q4_K
-                                          ? sizeof(block_q4_K) : sizeof(block_q6_K)) / QK_K;
+            const size_t ge = (size_t)N_EMBD * N_FF_EXP * qma_blk_size(m->layers[il].t_gate_exps) / QK_K;
+            const size_t ue = (size_t)N_EMBD * N_FF_EXP * qma_blk_size(m->layers[il].t_up_exps) / QK_K;
+            const size_t dn = (size_t)N_EMBD * N_FF_EXP * qma_blk_size(m->layers[il].t_down_exps) / QK_K;
             if (m->layers[il].off_gate_exps % 4096 || m->layers[il].off_up_exps % 4096 ||
-                m->layers[il].off_down_exps % 4096 || gu % 4096 || dn % 4096)
+                m->layers[il].off_down_exps % 4096 || ge % 4096 || ue % 4096 || dn % 4096)
                 ok = 0;
         }
         if (ok) {
@@ -613,7 +616,11 @@ static int gguf_scan(const char *path, gguf_scan_t *s, char *err, size_t errlen)
         switch (typ) {
         case GGML_TYPE_F32:  bs = 4;              blk = 1;   break;
         case GGML_TYPE_Q4_K: bs = sizeof(block_q4_K); blk = QK_K; break;
+        case GGML_TYPE_Q5_K: bs = sizeof(block_q5_K); blk = QK_K; break;
         case GGML_TYPE_Q6_K: bs = sizeof(block_q6_K); blk = QK_K; break;
+        case GGML_TYPE_Q3_K: bs = sizeof(block_q3_K); blk = QK_K; break;
+        case GGML_TYPE_IQ2_XS: bs = sizeof(block_iq2_xs); blk = QK_K; break;
+        case GGML_TYPE_IQ2_S:  bs = sizeof(block_iq2_s);  blk = QK_K; break;
         default:
             snprintf(err, errlen, "%s: tensor %u unsupported type %u", path, i, typ);
             goto out;

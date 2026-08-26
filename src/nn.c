@@ -73,6 +73,8 @@ typedef struct {
 static void qma_prefetch_experts(qma_t *m, int il, const int *ids, int n);
 static void qma_predict_prefetch(qma_t *m, int il, const float *x,
                                     const float *r_l, const moe_sel_t *sel);
+static float dot_w_f32(int wtype, const uint8_t *wr, const float *xp, int n);
+static void layer_slab_bytes(qma_t *m, int il, size_t *ge, size_t *ue, size_t *dn);
 static int  expert_fetch(void *user, int layer, int expert, uint8_t *dst);
 static size_t layer_rec_bytes(qma_t *m, int il);
 static int  pread_all(int fd, void *dst, size_t n, size_t off);
@@ -363,12 +365,8 @@ static void mm_worker(void *arg, int i0, int i1) {
         const uint8_t *wr = c->W + (size_t)r * c->wrow;
         for (int t = 0; t < c->T; t++) {
             const float *xp = c->xf + (size_t)t * c->n_in;
-            float s;
-            if (c->wtype == GGML_TYPE_Q4_K)
-                s = dot_q4_K_f32((const block_q4_K *)wr, xp, c->n_in);
-            else
-                s = dot_q6_K_f32((const block_q6_K *)wr, xp, c->n_in);
-            c->out[(size_t)t * c->n_out + r] = s;
+            c->out[(size_t)t * c->n_out + r] =
+                dot_w_f32(c->wtype, wr, xp, c->n_in);
         }
     }
 }
@@ -453,7 +451,7 @@ static void matmul(const float *x, const uint8_t *W, int n_in, int n_out, int T,
                              ss + (size_t)t * (n_in / 16));
         qbuf = sb; qds = sd; qsum = ss;
     }
-    size_t bs = (wtype == GGML_TYPE_Q4_K) ? sizeof(block_q4_K) : sizeof(block_q6_K);
+    size_t bs = qma_blk_size(wtype);
     mm_ctx c = { .W = W, .xf = x, .out = out, .n_in = n_in, .n_out = n_out,
                  .T = T, .wrow = (size_t)(n_in / QK_K) * bs, .wtype = wtype,
                  .qblocks = 0, .q8k = q8k && n_in % QK_K == 0,
@@ -533,6 +531,35 @@ static void add_m(float *out, const float *a, const float *b, int n, int T) {
     for (size_t i = 0; i < (size_t)n * T; i++) out[i] = a[i] + b[i];
 }
 
+/* generic weight-type dispatch ------------------------------------------ */
+/* f32-activation dot for any supported GGUF weight type */
+static float dot_w_f32(int wtype, const uint8_t *wr, const float *xp, int n) {
+    switch (wtype) {
+    case GGML_TYPE_Q4_K:   return dot_q4_K_f32((const block_q4_K *)wr, xp, n);
+    case GGML_TYPE_Q5_K:   return dot_q5_K_f32((const block_q5_K *)wr, xp, n);
+    case GGML_TYPE_Q6_K:   return dot_q6_K_f32((const block_q6_K *)wr, xp, n);
+    case GGML_TYPE_Q3_K:   return dot_q3_K_f32((const block_q3_K *)wr, xp, n);
+    case GGML_TYPE_IQ2_XS: return dot_iq2_xs_f32((const block_iq2_xs *)wr, xp, n);
+    case GGML_TYPE_IQ2_S:  return dot_iq2_s_f32((const block_iq2_s *)wr, xp, n);
+    default:               return 0.0f;
+    }
+}
+
+/* fused gate+up against one quantized activation when both rows share the
+   Q4_K fast path; otherwise falls back to two plain dots. */
+static void gateup_w_q8k(const uint8_t *g, const uint8_t *u,
+                         int gt, int ut,
+                         const int8_t *xq, const float *xd,
+                         const int16_t *xsum, int n,
+                         float *go, float *uo) {
+    if (gt == GGML_TYPE_Q4_K && ut == GGML_TYPE_Q4_K) {
+        qma_q8k_gateup(g, u, xq, xd, xsum, n, go, uo);
+        return;
+    }
+    *go = qma_q8k_dot(g, gt, xq, xd, xsum, n);
+    *uo = qma_q8k_dot(u, ut, xq, xd, xsum, n);
+}
+
 /* ---------------- MoE FFN (ref: llama_graph build_moe_ffn + build_layer_ffn) --
  * Router: logits = gate_inp.x  [256, T] -> softmax -> top-8 -> renormalize
  *          (norm_w=true, w_scale=0: HF Qwen3_5MoeTopKRouter divides by the
@@ -544,18 +571,19 @@ static void add_m(float *out, const float *a, const float *b, int n, int T) {
 
 /* one selected expert, one token: acc[N_EMBD] += w * down(silu(gate.x)*up.x) */
 static void moe_expert_one(const uint8_t *ge, const uint8_t *ue, const uint8_t *de,
-                           uint32_t de_type, const float *xp, float we, float *acc) {
+                           uint32_t ge_type, uint32_t ue_type, uint32_t de_type,
+                           const float *xp, float we, float *acc) {
+    const size_t ge_row = (size_t)(N_EMBD / QK_K) * qma_blk_size(ge_type);
+    const size_t ue_row = (size_t)(N_EMBD / QK_K) * qma_blk_size(ue_type);
+    const size_t de_row = (size_t)(N_FF_EXP / QK_K) * qma_blk_size(de_type);
     float gate[N_FF_EXP], up[N_FF_EXP];
     for (int i = 0; i < N_FF_EXP; i++) {
-        gate[i] = dot_q4_K_f32((const block_q4_K *)ge + (size_t)i * (N_EMBD / QK_K), xp, N_EMBD);
-        up[i]   = dot_q4_K_f32((const block_q4_K *)ue + (size_t)i * (N_EMBD / QK_K), xp, N_EMBD);
+        gate[i] = dot_w_f32(ge_type, ge + (size_t)i * ge_row, xp, N_EMBD);
+        up[i]   = dot_w_f32(ue_type, ue + (size_t)i * ue_row, xp, N_EMBD);
         gate[i] = (gate[i] / (1.0f + expf(-gate[i]))) * up[i];  /* silu(gate)*up */
     }
     for (int i = 0; i < N_EMBD; i++) {
-        if (de_type == GGML_TYPE_Q4_K)
-            acc[i] += we * dot_q4_K_f32((const block_q4_K *)de + (size_t)i * (N_FF_EXP / QK_K), gate, N_FF_EXP);
-        else
-            acc[i] += we * dot_q6_K_f32((const block_q6_K *)de + (size_t)i * (N_FF_EXP / QK_K), gate, N_FF_EXP);
+        acc[i] += we * dot_w_f32(de_type, de + (size_t)i * de_row, gate, N_FF_EXP);
     }
 }
 
@@ -563,24 +591,22 @@ static void moe_expert_one(const uint8_t *ge, const uint8_t *ue, const uint8_t *
    gated activation is quantized once per expert and shared by the down rows.
    gate/up are always Q4_K in this GGUF; down is Q4_K or Q6_K. */
 static void moe_expert_one_q8k(const uint8_t *ge, const uint8_t *ue,
-                               const uint8_t *de, uint32_t de_type,
+                               const uint8_t *de, uint32_t ge_type,
+                               uint32_t ue_type, uint32_t de_type,
                                const int8_t *xq, const float *xd,
                                const int16_t *xsum, float we,
                                int8_t *gq, float *gd, int16_t *gsum,
                                float *acc) {
     /* row stride: N_EMBD elements per gate/up row = N_EMBD/QK_K blocks */
-    const size_t gu_row = (N_EMBD / QK_K) * sizeof(block_q4_K);
-    const size_t dn_row = (N_FF_EXP / QK_K) *
-        (de_type == GGML_TYPE_Q4_K ? sizeof(block_q4_K) : sizeof(block_q6_K));
+    const size_t ge_row = (size_t)(N_EMBD / QK_K) * qma_blk_size(ge_type);
+    const size_t ue_row = (size_t)(N_EMBD / QK_K) * qma_blk_size(ue_type);
+    const size_t dn_row = (size_t)(N_FF_EXP / QK_K) * qma_blk_size(de_type);
     float gate[N_FF_EXP];
     for (int i = 0; i < N_FF_EXP; i++) {
-        /* fused: gate and up rows share the quantized activation — one pass
-           over xq/xd/xsum for both dots (mirrors moe_shared_q8k). This runs
-           T*N_EXPERT_USED times per layer, so the saved re-walk matters. */
+        /* fused when both slabs are Q4_K; else two plain dots */
         float g, u;
-        qma_q8k_gateup((const uint8_t *)ge + (size_t)i * gu_row,
-                          (const uint8_t *)ue + (size_t)i * gu_row,
-                          xq, xd, xsum, N_EMBD, &g, &u);
+        gateup_w_q8k(ge + (size_t)i * ge_row, ue + (size_t)i * ue_row,
+                     ge_type, ue_type, xq, xd, xsum, N_EMBD, &g, &u);
         gate[i] = (g / (1.0f + expf(-g))) * u;
     }
     /* quantize the gated activation once; every down row shares it */
@@ -599,25 +625,26 @@ static void moe_expert_one_q8k(const uint8_t *ge, const uint8_t *ue,
 static void moe_shared_q8k(qma_t *m, int il, uint32_t de_type,
                            const int8_t *xq, const float *xd,
                            const int16_t *xsum, float *acc) {
+    const uint32_t ge_type = m->layers[il].t_gate_shexp;
+    const uint32_t ue_type = m->layers[il].t_up_shexp;
     const float *gate_inp_sh = (const float *)m->layers[il].ffn_gate_inp_shexp;
-    const block_q4_K *gs4 = (const block_q4_K *)m->layers[il].ffn_gate_shexp;
-    const block_q4_K *us4 = (const block_q4_K *)m->layers[il].ffn_up_shexp;
+    const uint8_t *gs4 = m->layers[il].ffn_gate_shexp;
+    const uint8_t *us4 = m->layers[il].ffn_up_shexp;
     float gs = 0;
     for (int i = 0; i < N_EMBD; i++) gs += gate_inp_sh[i] * xq[i] * xd[i / QK_K];
     gs = 1.0f / (1.0f + expf(-gs));
     float gate[N_FF_SHEXP];
     int8_t gq[N_FF_SHEXP]; float gd[N_FF_SHEXP / QK_K]; int16_t gs2[N_FF_SHEXP / 16];
-    const size_t gu_row = (N_EMBD / QK_K) * sizeof(block_q4_K);
+    const size_t ge_row = (size_t)(N_EMBD / QK_K) * qma_blk_size(ge_type);
+    const size_t ue_row = (size_t)(N_EMBD / QK_K) * qma_blk_size(ue_type);
     for (int i = 0; i < N_FF_SHEXP; i++) {
         float g, u;
-        qma_q8k_gateup((const uint8_t *)gs4 + (size_t)i * gu_row,
-                          (const uint8_t *)us4 + (size_t)i * gu_row,
-                          xq, xd, xsum, N_EMBD, &g, &u);
+        gateup_w_q8k(gs4 + (size_t)i * ge_row, us4 + (size_t)i * ue_row,
+                     ge_type, ue_type, xq, xd, xsum, N_EMBD, &g, &u);
         gate[i] = (g / (1.0f + expf(-g))) * u;
     }
     qma_q8k_quant(gate, N_FF_SHEXP, gq, gd, gs2);
-    const size_t dn_row = (N_FF_SHEXP / QK_K) *
-        (de_type == GGML_TYPE_Q4_K ? sizeof(block_q4_K) : sizeof(block_q6_K));
+    const size_t dn_row = (size_t)(N_FF_SHEXP / QK_K) * qma_blk_size(de_type);
     for (int i = 0; i < N_EMBD; i++) {
         acc[i] += gs * qma_q8k_dot((const uint8_t *)m->layers[il].ffn_down_shexp +
                                       (size_t)i * dn_row,
@@ -626,21 +653,23 @@ static void moe_shared_q8k(qma_t *m, int il, uint32_t de_type,
 }
 
 static void moe_shared(qma_t *m, int il, uint32_t de_type, const float *xp, float *acc) {
+    const uint32_t ge_type = m->layers[il].t_gate_shexp;
+    const uint32_t ue_type = m->layers[il].t_up_shexp;
+    const size_t ge_row = (size_t)(N_EMBD / QK_K) * qma_blk_size(ge_type);
+    const size_t ue_row = (size_t)(N_EMBD / QK_K) * qma_blk_size(ue_type);
+    const size_t de_row = (size_t)(N_FF_SHEXP / QK_K) * qma_blk_size(de_type);
     const float *gate_inp_sh = (const float *)m->layers[il].ffn_gate_inp_shexp; /* [N_EMBD] */
     float gs = 0;
     for (int i = 0; i < N_EMBD; i++) gs += gate_inp_sh[i] * xp[i];
     gs = 1.0f / (1.0f + expf(-gs));   /* sigmoid */
     float gate[N_FF_SHEXP], up[N_FF_SHEXP];
     for (int i = 0; i < N_FF_SHEXP; i++) {
-        gate[i] = dot_q4_K_f32((const block_q4_K *)m->layers[il].ffn_gate_shexp + (size_t)i * (N_EMBD / QK_K), xp, N_EMBD);
-        up[i]   = dot_q4_K_f32((const block_q4_K *)m->layers[il].ffn_up_shexp + (size_t)i * (N_EMBD / QK_K), xp, N_EMBD);
+        gate[i] = dot_w_f32(ge_type, m->layers[il].ffn_gate_shexp + (size_t)i * ge_row, xp, N_EMBD);
+        up[i]   = dot_w_f32(ue_type, m->layers[il].ffn_up_shexp + (size_t)i * ue_row, xp, N_EMBD);
         gate[i] = (gate[i] / (1.0f + expf(-gate[i]))) * up[i];
     }
     for (int i = 0; i < N_EMBD; i++) {
-        if (de_type == GGML_TYPE_Q4_K)
-            acc[i] += gs * dot_q4_K_f32((const block_q4_K *)m->layers[il].ffn_down_shexp + (size_t)i * (N_FF_SHEXP / QK_K), gate, N_FF_SHEXP);
-        else
-            acc[i] += gs * dot_q6_K_f32((const block_q6_K *)m->layers[il].ffn_down_shexp + (size_t)i * (N_FF_SHEXP / QK_K), gate, N_FF_SHEXP);
+        acc[i] += gs * dot_w_f32(de_type, m->layers[il].ffn_down_shexp + (size_t)i * de_row, gate, N_FF_SHEXP);
     }
 }
 
@@ -749,7 +778,8 @@ static void moe_ffn(qma_t *m, int il, const float *x, const float *r_l, float *o
        (waste xpar). Each task holds its expert's record via the cache and
        writes its weighted partial into a per-task accumulator; the serial
        sum after the fork is order-independent. */
-    const size_t ge_bytes = (size_t)N_EMBD * N_FF_EXP * sizeof(block_q4_K) / QK_K;
+    size_t ge_bytes, ue_bytes, dn_bytes;
+    layer_slab_bytes(m, il, &ge_bytes, &ue_bytes, &dn_bytes);
     static int q8k_on = -1;
     if (q8k_on < 0) q8k_on = qma_q8k_available() && getenv("QMA_NOQ8K") == NULL;
     if (q8k_on) {
@@ -850,8 +880,10 @@ static void moe_xpar_worker(void *arg, int b, int e)
         const float *xp = xa->x + (size_t)t * N_EMBD;
         float *acc = xa->pacc + ((size_t)t * N_EXPERT_USED + k) * N_EMBD;
         const size_t ge_bytes = xa->ge_bytes;
+        const size_t ue_bytes = (size_t)N_EMBD * N_FF_EXP *
+            qma_blk_size(m->layers[il].t_up_exps) / QK_K;
         const size_t dn = (size_t)N_EMBD * N_FF_EXP *
-            (m->layers[il].t_down_exps == GGML_TYPE_Q4_K ? sizeof(block_q4_K) : sizeof(block_q6_K)) / QK_K;
+            qma_blk_size(m->layers[il].t_down_exps) / QK_K;
         const uint8_t *ge = NULL, *ue = NULL, *de = NULL;
         double tf = now_s();
         if (m->mmap_exps) {
@@ -859,7 +891,7 @@ static void moe_xpar_worker(void *arg, int b, int e)
                The kernel page cache is the cache; madvise (--preload) keeps
                the hot experts resident. No heap copy, no eviction churn. */
             ge = m->map + m->layers[il].off_gate_exps + (size_t)ex * ge_bytes;
-            ue = m->map + m->layers[il].off_up_exps   + (size_t)ex * ge_bytes;
+            ue = m->map + m->layers[il].off_up_exps   + (size_t)ex * ue_bytes;
             de = m->map + m->layers[il].off_down_exps + (size_t)ex * dn;
         } else {
             const uint8_t *rec = NULL;
@@ -868,7 +900,7 @@ static void moe_xpar_worker(void *arg, int b, int e)
             } else {
                 static __thread uint8_t *miss_buf = NULL;
                 static __thread size_t miss_cap = 0;
-                size_t need = 2 * ge_bytes + dn;
+                size_t need = ge_bytes + ue_bytes + dn;
                 if (!miss_buf || miss_cap < need) {
                     free(miss_buf);
                     /* 4K-aligned: with .4k-aligned GGUFs every slab offset and
@@ -896,18 +928,22 @@ static void moe_xpar_worker(void *arg, int b, int e)
             g_moe_fetched += 1;
             ge = rec;
             ue = rec + ge_bytes;
-            de = rec + 2 * ge_bytes;
+            de = rec + ge_bytes + ue_bytes;
         }
         double tc = now_s();
         if (xa->q8k) {
             int8_t gq[N_FF_EXP]; float gd[N_FF_EXP / QK_K]; int16_t gs[N_FF_EXP / 16];
-            moe_expert_one_q8k(ge, ue, de, m->layers[il].t_down_exps,
+            moe_expert_one_q8k(ge, ue, de,
+                               m->layers[il].t_gate_exps, m->layers[il].t_up_exps,
+                               m->layers[il].t_down_exps,
                                xa->xq + (size_t)t * N_EMBD,
                                xa->xd + (size_t)t * (N_EMBD / QK_K),
                                xa->xsum + (size_t)t * (N_EMBD / 16),
                                we, gq, gd, gs, acc);
         } else {
-            moe_expert_one(ge, ue, de, m->layers[il].t_down_exps, xp, we, acc);
+            moe_expert_one(ge, ue, de,
+                           m->layers[il].t_gate_exps, m->layers[il].t_up_exps,
+                           m->layers[il].t_down_exps, xp, we, acc);
         }
         g_moe_comp_us += (now_s() - tc) * 1e6;
     }
@@ -1961,12 +1997,20 @@ static void kv_append(const attn_ctx *c) {
 
 /* one expert record = gate slab + up slab + down slab, concatenated.
    gate/up are Q4_K; down is Q4_K or Q6_K depending on the layer. */
-static size_t layer_rec_bytes(qma_t *m, int il) {
+/* per-layer expert slab byte sizes (one expert's worth of each tensor).
+   With UD mixes gate/up/down can each be a different quant. */
+static void layer_slab_bytes(qma_t *m, int il,
+                             size_t *ge, size_t *ue, size_t *dn) {
     const size_t slab = (size_t)N_EMBD * N_FF_EXP;
-    const size_t gu = slab * sizeof(block_q4_K) / QK_K;
-    const size_t dn = slab * (m->layers[il].t_down_exps == GGML_TYPE_Q4_K
-                                  ? sizeof(block_q4_K) : sizeof(block_q6_K)) / QK_K;
-    return gu + gu + dn;
+    *ge = slab * qma_blk_size(m->layers[il].t_gate_exps) / QK_K;
+    *ue = slab * qma_blk_size(m->layers[il].t_up_exps) / QK_K;
+    *dn = slab * qma_blk_size(m->layers[il].t_down_exps) / QK_K;
+}
+
+static size_t layer_rec_bytes(qma_t *m, int il) {
+    size_t ge, ue, dn;
+    layer_slab_bytes(m, il, &ge, &ue, &dn);
+    return ge + ue + dn;
 }
 
 /* pread-all: a short read is legal, loop until the whole range lands. */
@@ -1989,12 +2033,9 @@ static int pread_all(int fd, void *dst, size_t n, size_t off)
    zero-copy through the mapping with page faults instead of disk seeks. */
 static void expert_readahead(qma_t *m, int layer, int expert) {
     if (layer < 0 || layer >= N_LAYER || expert < 0 || expert >= N_EXPERT) return;
-    const size_t slab = (size_t)N_EMBD * N_FF_EXP;
-    const size_t gu = slab * sizeof(block_q4_K) / QK_K;
-    const size_t dn = slab * (m->layers[layer].t_down_exps == GGML_TYPE_Q4_K
-                                  ? sizeof(block_q4_K) : sizeof(block_q6_K)) / QK_K;
-    readahead(m->fd, m->layers[layer].off_gate_exps + (size_t)expert * gu, gu);
-    readahead(m->fd, m->layers[layer].off_up_exps   + (size_t)expert * gu, gu);
+    size_t ge, ue, dn; layer_slab_bytes(m, layer, &ge, &ue, &dn);
+    readahead(m->fd, m->layers[layer].off_gate_exps + (size_t)expert * ge, ge);
+    readahead(m->fd, m->layers[layer].off_up_exps   + (size_t)expert * ue, ue);
     readahead(m->fd, m->layers[layer].off_down_exps + (size_t)expert * dn, dn);
 }
 
@@ -2003,10 +2044,7 @@ static int expert_fetch(void *user, int layer, int expert, uint8_t *dst)
     qma_t *m = (qma_t *)user;
     if (layer < 0 || layer >= N_LAYER || expert < 0 || expert >= N_EXPERT)
         return -1;
-    const size_t slab = (size_t)N_EMBD * N_FF_EXP;
-    const size_t gu = slab * sizeof(block_q4_K) / QK_K;
-    const size_t dn = slab * (m->layers[layer].t_down_exps == GGML_TYPE_Q4_K
-                                  ? sizeof(block_q4_K) : sizeof(block_q6_K)) / QK_K;
+    size_t ge, ue, dn; layer_slab_bytes(m, layer, &ge, &ue, &dn);
     /* O_DIRECT path: expert bytes land straight in the pool — no page-cache
        copy at all. Only when the fd exists AND the destination is 4K-aligned
        (O_DIRECT requires an aligned buffer; pool slots are 16K-aligned). */
@@ -2017,11 +2055,11 @@ static int expert_fetch(void *user, int layer, int expert, uint8_t *dst)
     if (use_dio_env < 0) use_dio_env = getenv("QMA_DIO") != NULL;
     const int use_dio = use_dio_env && (m->dio_fd >= 0) && (((uintptr_t)dst & 4095u) == 0);
     const int fd = use_dio ? m->dio_fd : m->fd;
-    if (pread_all(fd, dst, gu, m->layers[layer].off_gate_exps + (size_t)expert * gu) != 0)
+    if (pread_all(fd, dst, ge, m->layers[layer].off_gate_exps + (size_t)expert * ge) != 0)
         return -1;
-    if (pread_all(fd, dst + gu, gu, m->layers[layer].off_up_exps + (size_t)expert * gu) != 0)
+    if (pread_all(fd, dst + ge, ue, m->layers[layer].off_up_exps + (size_t)expert * ue) != 0)
         return -1;
-    if (pread_all(fd, dst + 2 * gu, dn, m->layers[layer].off_down_exps + (size_t)expert * dn) != 0)
+    if (pread_all(fd, dst + ge + ue, dn, m->layers[layer].off_down_exps + (size_t)expert * dn) != 0)
         return -1;
     /* Buffered preads just populated the page cache with expert pages. The
        ecache pool now owns these bytes and experts are NEVER read via the
@@ -2035,9 +2073,8 @@ static int expert_fetch(void *user, int layer, int expert, uint8_t *dst)
     if (!use_dio && m->map) {
         static int drop_exp = -1;
         if (drop_exp < 0) drop_exp = getenv("QMA_EXPDROP") != NULL;
-        if (drop_exp) {
-            madvise(m->map + m->layers[layer].off_gate_exps + (size_t)expert * gu, gu, MADV_DONTNEED);
-            madvise(m->map + m->layers[layer].off_up_exps   + (size_t)expert * gu, gu, MADV_DONTNEED);
+        if (drop_exp) {            madvise(m->map + m->layers[layer].off_gate_exps + (size_t)expert * ge, ge, MADV_DONTNEED);
+            madvise(m->map + m->layers[layer].off_up_exps   + (size_t)expert * ue, ue, MADV_DONTNEED);
             madvise(m->map + m->layers[layer].off_down_exps + (size_t)expert * dn, dn, MADV_DONTNEED);
         }
     }
@@ -2502,12 +2539,17 @@ static void embed_row(qma_t *m, int id, float *out) {
     /* token_embd row id is a contiguous slab of N_EMBD weights (the vocab
        index is the slowest dim). Type is resolved at load time (m->t_token_embd)
        -- must NOT be assumed to be Q4_K, it may be Q6_K in this GGUF. */
-    size_t bs = (m->t_token_embd == GGML_TYPE_Q4_K) ? sizeof(block_q4_K) : sizeof(block_q6_K);
+    size_t bs = qma_blk_size(m->t_token_embd);
     const uint8_t *row = m->token_embd + (size_t)id * (size_t)(N_EMBD / QK_K) * bs;
-    if (m->t_token_embd == GGML_TYPE_Q4_K)
-        dequantize_row_q4_K((const block_q4_K *)row, out, N_EMBD);
-    else
-        dequantize_row_q6_K((const block_q6_K *)row, out, N_EMBD);
+    switch (m->t_token_embd) {
+    case GGML_TYPE_Q4_K:   dequantize_row_q4_K((const block_q4_K *)row, out, N_EMBD); break;
+    case GGML_TYPE_Q5_K:   dequantize_row_q5_K((const block_q5_K *)row, out, N_EMBD); break;
+    case GGML_TYPE_Q6_K:   dequantize_row_q6_K((const block_q6_K *)row, out, N_EMBD); break;
+    case GGML_TYPE_Q3_K:   dequantize_row_q3_K((const block_q3_K *)row, out, N_EMBD); break;
+    case GGML_TYPE_IQ2_XS: dequantize_row_iq2_xs((const block_iq2_xs *)row, out, N_EMBD); break;
+    case GGML_TYPE_IQ2_S:  dequantize_row_iq2_s((const block_iq2_s *)row, out, N_EMBD); break;
+    default:               memset(out, 0, N_EMBD * sizeof(float)); break;
+    }
 }
 
 int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,

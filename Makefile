@@ -7,7 +7,7 @@ CFLAGS  += -mcpu=native -ffast-math -fomit-frame-pointer -pthread -I src/lfm -I 
 LDFLAGS ?= -lm -pthread -ldl
 
 ENGINE = src/gguf.c src/tokenizer.c src/nn.c src/quants.c src/sampler.c \
-         src/ecache.c src/q8k.c src/kvq.c src/intern.c \
+         src/ecache.c src/q8k.c src/qkerns.c src/kvq.c src/intern.c \
          src/lfm/lfm_gguf.c src/lfm/lfm_tokenizer.c src/lfm/lfm_nn.c \
          src/lfm/lfm_sampler.c src/worker.c
 AGENT  = src/json.c src/toolparse.c src/tools.c src/thermal.c src/selfctx.c src/agent.c src/cl.c
@@ -29,8 +29,8 @@ tests/test_intern: tests/test_intern.c src/intern.c src/intern.h src/selfctx.c s
 tests/cltest: tests/cltest.c src/cl.c src/cl.h src/quants.c src/qma.h
 	$(CC) $(CFLAGS) -I src -o $@ tests/cltest.c src/cl.c src/quants.c $(LDFLAGS)
 
-tests/test_q8kgemm: tests/test_q8kgemm.c src/q8k.c src/quants.c src/qma.h
-	$(CC) $(CFLAGS) -I src -o $@ tests/test_q8kgemm.c src/q8k.c src/quants.c $(LDFLAGS)
+tests/test_q8kgemm: tests/test_q8kgemm.c src/q8k.c src/qkerns.c src/quants.c src/qma.h
+	$(CC) $(CFLAGS) -I src -o $@ tests/test_q8kgemm.c src/q8k.c src/qkerns.c src/quants.c $(LDFLAGS)
 
 test: tests/test_toolparse tests/test_intern tests/cltest tests/test_q8kgemm
 	./tests/test_toolparse
