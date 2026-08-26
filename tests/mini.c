@@ -48,7 +48,8 @@ int main(int argc, char **argv) {
     qma_prefetch_init(&m);
 
     runstate_t rs;
-    if (runstate_init(&rs, 8192) != 0) { fprintf(stderr, "rs init failed\n"); return 1; }
+    int ctx = getenv("QMA_CTX") ? atoi(getenv("QMA_CTX")) : 8192;
+    if (runstate_init(&rs, ctx) != 0) { fprintf(stderr, "rs init failed\n"); return 1; }
 
     int ids[4096];
     int n = qma_tokenize(&m, prompt, ids, 4096);
@@ -61,6 +62,12 @@ int main(int argc, char **argv) {
     static float logits[N_VOCAB];
     if (qma_eval(&m, &rs, ids, n, logits, threads, prefetch, 0) != 0) {
         fprintf(stderr, "prefill failed\n"); return 1;
+    }
+    if (getenv("QMA_LOGDGB")) {
+        float mn=1e30f, mx=-1e30f; double s=0; int nz=0;
+        for (int v=0; v<m.n_vocab; v++) { if(logits[v]<mn)mn=logits[v]; if(logits[v]>mx)mx=logits[v]; s+=logits[v]; if(logits[v]!=0.0f)nz++; }
+        fprintf(stderr, "LOGDGB: n_vocab=%d output=%p outnorm=%p logits[min=%.3g max=%.3g sum=%.3g nz=%d/%d]\n",
+                m.n_vocab, (void*)m.output, (void*)m.output_norm, mn, mx, s, nz, m.n_vocab);
     }
     printf("== %s\n", prompt);
     for (int step = 0; step < n_gen; step++) {
