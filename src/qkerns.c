@@ -449,4 +449,56 @@ float qma_dot_iq2_s_q8k(const block_iq2_s *b, const int8_t *xq,
     return total;
 }
 
+
+/* ===================== Q8_0 ===================== */
+
+void dequantize_row_q8_0(const void *xv, float *y, int64_t k) {
+    const block_q8_0 *x = xv;
+    const int64_t nb = k / QK8_0;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = half_to_float(x[i].d);
+        for (int j = 0; j < QK8_0; j++) y[i * QK8_0 + j] = d * x[i].qs[j];
+    }
+}
+
+float dot_q8_0_f32(const void *wv, const float *x, int n) {
+    const block_q8_0 *w = wv;
+    const int nb = n / QK8_0;
+    float total = 0.f;
+    for (int i = 0; i < nb; i++) {
+        const float d = half_to_float(w[i].d);
+        const float *xp = x + (size_t)i * QK8_0;
+        float sum = 0.f;
+        for (int j = 0; j < QK8_0; j++) sum += w[i].qs[j] * xp[j];
+        total += d * sum;
+    }
+    return total;
+}
+
+#if defined(__ARM_FEATURE_DOTPROD)
+/* Q8_0 weights are already int8 with a per-32 fp16 scale; activation
+   quant contributes xd per super-block (QK_K) and xsum is unused. */
+float qma_dot_q8_0_q8k(const void *wv, const int8_t *xq,
+                       const float *xd, int cols) {
+    const block_q8_0 *w = wv;
+    const int nblk = cols / QK8_0;
+    float total = 0.f;
+    for (int b = 0; b < nblk; b += QK_K / QK8_0) {   /* one super-block */
+        const float xdb = xd[b / (QK_K / QK8_0)];
+        float32x4_t acc = vdupq_n_f32(0.f);
+        for (int g = 0; g < QK_K / QK8_0 && b + g < nblk; g++) {
+            const block_q8_0 *wb = &w[b + g];
+            const float d = half_to_float(wb->d);
+            const int32x4_t p = vdotq_s32(vdupq_n_s32(0),
+                                          vld1q_s8(wb->qs),
+                                          vld1q_s8(xq));
+            acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p), d * xdb);
+            xq += QK8_0;
+        }
+        total += vaddvq_f32(acc);
+    }
+    return total;
+}
+#endif /* __ARM_FEATURE_DOTPROD */
+
 #endif /* __ARM_FEATURE_DOTPROD */

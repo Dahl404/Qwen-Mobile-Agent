@@ -69,6 +69,9 @@
 #define GGML_TYPE_Q5_K  13
 #define GGML_TYPE_Q6_K  14
 #define GGML_TYPE_Q3_K  11
+#define GGML_TYPE_Q3_KXS 18   /* same block layout as Q3_K, distinct id */
+#define GGML_TYPE_Q2_K  10
+#define GGML_TYPE_BF16  30
 #define GGML_TYPE_IQ2_XS 17
 #define GGML_TYPE_IQ2_S  23
 #define GGML_TYPE_Q8_0   8
@@ -108,6 +111,15 @@ typedef struct {
     uint8_t  qs[QK_K/2];          /* low 4 bits */
 } block_q5_K;
 
+/* Q2_K: 16 groups of 16, 4-bit quants, per-group scale/min in 5-bit
+ * packed nibble pairs. weight = d*sc*q - dmin*m. 84 B / 256 w. */
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[QK_K/16];     /* 16 x 4-bit scale/min pairs */
+    uint8_t  qs[QK_K/4];          /* 4-bit quants */
+} block_q2_K;
+
 /* Q3_K: 16 groups of 16, weight = d*(sc-32)*(q - 4*[high bit clear]),
  * q in [0,3] from 2-bit fields + hmask high bits. 110 B / 256 w. */
 typedef struct {
@@ -146,6 +158,9 @@ static inline size_t qma_blk_size(int type) {
     case GGML_TYPE_Q5_K:  return sizeof(block_q5_K);   /* 176 */
     case GGML_TYPE_Q6_K:  return sizeof(block_q6_K);   /* 210 */
     case GGML_TYPE_Q3_K:  return sizeof(block_q3_K);   /* 110 */
+    case GGML_TYPE_Q3_KXS:return sizeof(block_q3_K);   /* same layout */
+    case GGML_TYPE_Q2_K:  return sizeof(block_q2_K);   /* 84  */
+    case GGML_TYPE_Q8_0:  return sizeof(block_q8_0) * (QK_K/QK8_0); /* 272 */
     case GGML_TYPE_IQ2_XS:return sizeof(block_iq2_xs); /* 74  */
     case GGML_TYPE_IQ2_S: return sizeof(block_iq2_s);  /* 82  */
     default:              return 0;
@@ -424,6 +439,10 @@ void     dequantize_row_iq2_xs(const block_iq2_xs *x, float *y, int64_t k);
 void     dequantize_row_iq2_s(const block_iq2_s *x, float *y, int64_t k);
 float    dot_q4_K_f32(const block_q4_K *W, const float *x, int n);
 float    dot_q6_K_f32(const block_q6_K *W, const float *x, int n);
+void     dequantize_row_q8_0(const void *x, float *y, int64_t k);
+float    dot_q8_0_f32(const void *W, const float *x, int n);
+float    qma_dot_q8_0_q8k(const void *b, const int8_t *xq,
+                          const float *xd, int n);
 float    dot_q5_K_f32(const block_q5_K *W, const float *x, int n);
 float    dot_q3_K_f32(const block_q3_K *W, const float *x, int n);
 float    dot_iq2_xs_f32(const block_iq2_xs *W, const float *x, int n);

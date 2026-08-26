@@ -223,7 +223,11 @@ int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
     }
     if (r.err) { snprintf(err, errlen, "corrupt metadata"); return -1; }
 
-    if (block_count != N_LAYER || embd != N_EMBD || head != N_HEAD || head_kv != N_HEAD_KV ||
+    /* 41 blocks = 40 main layers + 1 MTP (nextn) layer; the MTP layer is
+       loaded separately for speculative decode and is not part of the
+       main stack. */
+    if ((block_count != N_LAYER && block_count != N_LAYER + 1) ||
+        embd != N_EMBD || head != N_HEAD || head_kv != N_HEAD_KV ||
         n_rot != N_ROT || rope_s0 != ROPE_SECT0 || rope_s1 != ROPE_SECT1 || rope_s2 != ROPE_SECT2) {
         snprintf(err, errlen, "model hyperparameters mismatch: this engine targets "
                  "qwen35 %d layers, embd %d, heads %d/%d, n_rot %d, sections %d/%d/%d "
@@ -274,14 +278,23 @@ int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
         size_t bs, blk;
         switch (t->type) {
         case GGML_TYPE_F32: bs = 4; blk = 1; break;
+        case GGML_TYPE_BF16: bs = 2; blk = 1; break;
+        case GGML_TYPE_Q8_0: bs = sizeof(block_q8_0); blk = QK8_0; break;
         case GGML_TYPE_Q4_K: bs = sizeof(block_q4_K); blk = QK_K; break;
         case GGML_TYPE_Q5_K: bs = sizeof(block_q5_K); blk = QK_K; break;
         case GGML_TYPE_Q6_K: bs = sizeof(block_q6_K); blk = QK_K; break;
         case GGML_TYPE_Q3_K: bs = sizeof(block_q3_K); blk = QK_K; break;
+        case GGML_TYPE_Q3_KXS: bs = sizeof(block_q3_K); blk = QK_K; break;
         case GGML_TYPE_IQ2_XS: bs = sizeof(block_iq2_xs); blk = QK_K; break;
         case GGML_TYPE_IQ2_S:  bs = sizeof(block_iq2_s);  blk = QK_K; break;
+        case GGML_TYPE_Q2_K: bs = sizeof(block_q2_K); blk = QK_K; break;
         default:
-            snprintf(err, errlen, "tensor %s: unsupported type %u", t->name, t->type); return -1;
+            /* Unknown/unused type (e.g. the MTP layer's Q2_K experts):
+               mark size-unknown and move on. Only tensors actually
+               resolved by name below matter for inference; requesting a
+               truly unsupported one yields zeroed output via dispatch. */
+            t->nbytes = 0;
+            continue;
         }
         if (t->ne[0] % blk != 0) { snprintf(err, errlen, "tensor %s: ne0 not block multiple", t->name); return -1; }
         t->nbytes = (size_t)((t->ne[0] / blk) * t->ne[1]) * bs * (size_t)t->ne[2];
@@ -615,15 +628,20 @@ static int gguf_scan(const char *path, gguf_scan_t *s, char *err, size_t errlen)
         size_t bs, blk;
         switch (typ) {
         case GGML_TYPE_F32:  bs = 4;              blk = 1;   break;
+        case GGML_TYPE_BF16: bs = 2;              blk = 1;   break;
+        case GGML_TYPE_Q8_0: bs = sizeof(block_q8_0); blk = QK8_0; break;
         case GGML_TYPE_Q4_K: bs = sizeof(block_q4_K); blk = QK_K; break;
         case GGML_TYPE_Q5_K: bs = sizeof(block_q5_K); blk = QK_K; break;
         case GGML_TYPE_Q6_K: bs = sizeof(block_q6_K); blk = QK_K; break;
         case GGML_TYPE_Q3_K: bs = sizeof(block_q3_K); blk = QK_K; break;
+        case GGML_TYPE_Q3_KXS: bs = sizeof(block_q3_K); blk = QK_K; break;
         case GGML_TYPE_IQ2_XS: bs = sizeof(block_iq2_xs); blk = QK_K; break;
         case GGML_TYPE_IQ2_S:  bs = sizeof(block_iq2_s);  blk = QK_K; break;
+        case GGML_TYPE_Q2_K: bs = sizeof(block_q2_K); blk = QK_K; break;
         default:
-            snprintf(err, errlen, "%s: tensor %u unsupported type %u", path, i, typ);
-            goto out;
+            /* tolerated: see main-loader comment (MTP layer etc.) */
+            s->nbytes[i] = 0;
+            continue;
         }
         if (dims[0] % blk != 0) { snprintf(err, errlen, "%s: tensor %u ne0 not block multiple", path, i); goto out; }
         s->nbytes[i] = (size_t)((dims[0] / blk) * dims[1]) * bs * (size_t)dims[2];

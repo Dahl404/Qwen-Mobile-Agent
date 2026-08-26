@@ -541,6 +541,7 @@ static float dot_w_f32(int wtype, const uint8_t *wr, const float *xp, int n) {
     case GGML_TYPE_Q3_K:   return dot_q3_K_f32((const block_q3_K *)wr, xp, n);
     case GGML_TYPE_IQ2_XS: return dot_iq2_xs_f32((const block_iq2_xs *)wr, xp, n);
     case GGML_TYPE_IQ2_S:  return dot_iq2_s_f32((const block_iq2_s *)wr, xp, n);
+    case GGML_TYPE_Q8_0:   return dot_q8_0_f32(wr, xp, n);
     default:               return 0.0f;
     }
 }
@@ -2548,6 +2549,7 @@ static void embed_row(qma_t *m, int id, float *out) {
     case GGML_TYPE_Q3_K:   dequantize_row_q3_K((const block_q3_K *)row, out, N_EMBD); break;
     case GGML_TYPE_IQ2_XS: dequantize_row_iq2_xs((const block_iq2_xs *)row, out, N_EMBD); break;
     case GGML_TYPE_IQ2_S:  dequantize_row_iq2_s((const block_iq2_s *)row, out, N_EMBD); break;
+    case GGML_TYPE_Q8_0:   dequantize_row_q8_0(row, out, N_EMBD); break;
     default:               memset(out, 0, N_EMBD * sizeof(float)); break;
     }
 }
