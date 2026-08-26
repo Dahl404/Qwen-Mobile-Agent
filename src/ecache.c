@@ -70,7 +70,7 @@ static uint32_t ec_hash(int32_t k)
 
 /* ---- reader threads ----------------------------------------------------- */
 
-typedef struct { int slot, layer, expert; int prio; } eio_job;
+typedef struct { int slot, layer, expert; int prio; int src; } eio_job;
 
 struct qma_eio {
     pthread_t th[EC_MAXIO];
@@ -99,19 +99,20 @@ static void *eio_worker(void *p)
         io->qn--;
         pthread_mutex_unlock(&io->mu);
 
-        const int rc = c->fetch(c->fetch_user, j.layer, j.expert,
-                                c->slot[j.slot].data);
+        const qma_fetch_fn ff = (j.src && c->fetch_q2) ? c->fetch_q2 : c->fetch;
+        const int rc = ff(c->fetch_user, j.layer, j.expert,
+                          c->slot[j.slot].data);
 
         pthread_mutex_lock(&io->mu);
         c->slot[j.slot].state = rc == 0 ? (uint8_t)EC_READY : (uint8_t)EC_FAILED;
-        c->slot[j.slot].src = 0;   /* io-thread fills are always primary (Q4) */
+        c->slot[j.slot].src = (j.src && c->fetch_q2) ? 1 : 0;
         pthread_cond_broadcast(&io->done);
         pthread_mutex_unlock(&io->mu);
     }
 }
 
 /* caller holds the lock; prio 1 = demand (hint), 0 = speculative */
-static int eio_push(struct qma_eio *io, int slot, int layer, int expert, int prio)
+static int eio_push(struct qma_eio *io, int slot, int layer, int expert, int prio, int src)
 {
     if (io->qn == EC_QCAP) return -1;
     /* demand reads jump the queue ahead of speculative reads */
@@ -129,9 +130,9 @@ static int eio_push(struct qma_eio *io, int slot, int layer, int expert, int pri
             const int to = (io->qhead + i) % EC_QCAP;
             io->q[to] = io->q[from];
         }
-        io->q[ip] = (eio_job){ slot, layer, expert, prio };
+        io->q[ip] = (eio_job){ slot, layer, expert, prio, src };
     } else {
-        io->q[(io->qhead + io->qn) % EC_QCAP] = (eio_job){ slot, layer, expert, prio };
+        io->q[(io->qhead + io->qn) % EC_QCAP] = (eio_job){ slot, layer, expert, prio, src };
     }
     io->qn++;
     pthread_cond_signal(&io->work);
@@ -365,7 +366,7 @@ static void ec_issue_next(qma_ecache *c)
         if (vi < 0) { c->pf_issued--; return; }
         ec_claim(c, vi, key, 1);
         c->prefetched++;
-        if (eio_push(c->io, vi, c->pf_layer, eid, 1) != 0) {
+        if (eio_push(c->io, vi, c->pf_layer, eid, 1, 0) != 0) {   /* hint: Q4 */
             c->prefetched--;
             c->misses--;
             c->bytes_read -= c->rec_bytes;
@@ -387,7 +388,7 @@ void qma_ecache_prefetch(qma_ecache *c, int layer, const int *ids, int n)
         const int vi = ec_victim(c);
         if (vi < 0) break;
         ec_claim_spec(c, vi, key);
-        if (eio_push(c->io, vi, layer, ids[i], 0) != 0) {
+        if (eio_push(c->io, vi, layer, ids[i], 0, 0) != 0) {   /* spec: Q4 */
             c->spec_issued--;
             c->bytes_read -= c->rec_bytes;
             ec_drop(c, vi);
@@ -555,7 +556,7 @@ int qma_ecache_src(const qma_ecache *c, int layer, int expert)
     ec_lock((qma_ecache *)c);
     int si = ec_lookup((qma_ecache *)c, key);
     if (si >= 0 && c->slot[si].state == EC_READY)
-        rc = c->slot[si].src;
+        rc = c->slot[si].src == 0 ? 0 : 1;   /* 1 and 2 both decode as Q2 */
     ec_unlock((qma_ecache *)c);
     return rc;
 }

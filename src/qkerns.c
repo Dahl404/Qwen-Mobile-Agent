@@ -604,12 +604,13 @@ float qma_dot_iq3_xxs_q8k(const block_iq3_xxs *b, const int8_t *xq,
             const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
             int8_t w[32];
             for (int l = 0; l < 4; ++l) {
-                const uint8_t sgn = ksigns_iq2xs[(aux32 >> 7 * l) & 127];
+                const int sidx = (aux32 >> 7 * l) & 127;
                 const uint8_t *g1 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 0]);
                 const uint8_t *g2 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 1]);
+                const int8_t *sv = iq3s_sign[sidx];
                 for (int j = 0; j < 4; ++j) {
-                    w[8 * l + j]     = (int8_t)(sgn & kmask_iq2xs[j + 0] ? -g1[j] : g1[j]);
-                    w[8 * l + j + 4] = (int8_t)(sgn & kmask_iq2xs[j + 4] ? -g2[j] : g2[j]);
+                    w[8 * l + j]     = (int8_t)(sv[j + 0] * (int8_t)g1[j]);
+                    w[8 * l + j + 4] = (int8_t)(sv[j + 4] * (int8_t)g2[j]);
                 }
             }
             int32x4_t p0 = vdotq_s32(vdupq_n_s32(0), vld1q_s8(w),     vld1q_s8(xp));
