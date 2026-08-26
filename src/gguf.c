@@ -120,8 +120,11 @@ int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
        pressure during weight streaming (best-effort, no-op if unsupported) */
     madvise(m->map, m->map_size, MADV_HUGEPAGE);
     /* the whole file is hot: pre-warm the page cache so first-token eval
-       doesn't fault weights in from flash mid-generation */
-    madvise(m->map, m->map_size, MADV_WILLNEED);
+       doesn't fault weights in from flash mid-generation. QMA_NOPREWARM=1
+       skips this for debug harnesses (each run then costs a few seconds
+       instead of a full-file warm). */
+    if (getenv("QMA_NOPREWARM") == NULL)
+        madvise(m->map, m->map_size, MADV_WILLNEED);
 
     reader_t r = { m->map, m->map + m->map_size, 0 };
 
@@ -284,9 +287,10 @@ int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
         case GGML_TYPE_Q5_K: bs = sizeof(block_q5_K); blk = QK_K; break;
         case GGML_TYPE_Q6_K: bs = sizeof(block_q6_K); blk = QK_K; break;
         case GGML_TYPE_Q3_K: bs = sizeof(block_q3_K); blk = QK_K; break;
-        case GGML_TYPE_Q3_KXS: bs = sizeof(block_q3_K); blk = QK_K; break;
+        case GGML_TYPE_IQ3_XXS: bs = sizeof(block_iq3_xxs); blk = QK_K; break;
         case GGML_TYPE_IQ2_XS: bs = sizeof(block_iq2_xs); blk = QK_K; break;
         case GGML_TYPE_IQ2_S:  bs = sizeof(block_iq2_s);  blk = QK_K; break;
+        case GGML_TYPE_IQ4_XS: bs = sizeof(block_iq4_xs); blk = QK_K; break;
         case GGML_TYPE_Q2_K: bs = sizeof(block_q2_K); blk = QK_K; break;
         default:
             /* Unknown/unused type (e.g. the MTP layer's Q2_K experts):
@@ -358,6 +362,45 @@ int qma_load(qma_t *m, const char *path, char *err, size_t errlen) {
             snprintf(nm, sizeof(nm), "blk.%d.ssm_alpha.weight", il);  FIND_T(m->layers[il].ssm_alpha, m->layers[il].t_alpha, nm);
             snprintf(nm, sizeof(nm), "blk.%d.ssm_norm.weight", il);   FIND(m->layers[il].ssm_norm, nm);
             snprintf(nm, sizeof(nm), "blk.%d.ssm_out.weight", il);    FIND_T(m->layers[il].ssm_out, m->layers[il].t_out, nm);
+        }
+        if (getenv("QMA_TYPES")) {
+            /* F32-assumed tensors: verify they really are F32 */
+            const char *f32names[] = {
+                "ssm_conv1d.weight", "ssm_dt.bias", "ssm_a",
+                "ssm_norm.weight", "ffn_gate_inp.weight",
+                "ffn_gate_inp_shexp.weight", "attn_norm.weight",
+                "post_attention_norm.weight"
+            };
+            for (size_t fi = 0; fi < sizeof(f32names)/sizeof(f32names[0]); fi++) {
+                snprintf(nm, sizeof(nm), "blk.%d.%s", il, f32names[fi]);
+                for (uint32_t i = 0; i < m->n_tensors; i++)
+                    if (strcmp(m->tensors[i].name, nm) == 0 &&
+                        m->tensors[i].type != GGML_TYPE_F32)
+                        fprintf(stderr, "qma: TYPES-WARN %s is type %u (engine assumes F32!)\n",
+                                nm, m->tensors[i].type);
+            }
+            snprintf(nm, sizeof(nm), "blk.%d.ssm_a", il);
+            for (uint32_t i = 0; i < m->n_tensors; i++)
+                if (strcmp(m->tensors[i].name, nm) == 0 && m->tensors[i].type != GGML_TYPE_F32)
+                    fprintf(stderr, "qma: TYPES-WARN %s is type %u (engine assumes F32!)\n",
+                            nm, m->tensors[i].type);
+            if (at)
+                fprintf(stderr, "qma: types il=%d ATTN  q/k/v/o=%u/%u/%u/%u gate/up/down=%u/%u/%u shexp=%u/%u/%u\n",
+                        il, m->layers[il].t_wq, m->layers[il].t_wk,
+                        m->layers[il].t_wv, m->layers[il].t_wo,
+                        m->layers[il].t_gate_exps, m->layers[il].t_up_exps,
+                        m->layers[il].t_down_exps,
+                        m->layers[il].t_gate_shexp, m->layers[il].t_up_shexp,
+                        m->layers[il].t_down_shexp);
+            else
+                fprintf(stderr, "qma: types il=%d GDN   qkv/gate/beta/alpha/out=%u/%u/%u/%u/%u gate/up/down=%u/%u/%u shexp=%u/%u/%u\n",
+                        il, m->layers[il].t_wqkv, m->layers[il].t_gate,
+                        m->layers[il].t_beta, m->layers[il].t_alpha,
+                        m->layers[il].t_out,
+                        m->layers[il].t_gate_exps, m->layers[il].t_up_exps,
+                        m->layers[il].t_down_exps,
+                        m->layers[il].t_gate_shexp, m->layers[il].t_up_shexp,
+                        m->layers[il].t_down_shexp);
         }
     }
     #undef FIND
@@ -634,9 +677,10 @@ static int gguf_scan(const char *path, gguf_scan_t *s, char *err, size_t errlen)
         case GGML_TYPE_Q5_K: bs = sizeof(block_q5_K); blk = QK_K; break;
         case GGML_TYPE_Q6_K: bs = sizeof(block_q6_K); blk = QK_K; break;
         case GGML_TYPE_Q3_K: bs = sizeof(block_q3_K); blk = QK_K; break;
-        case GGML_TYPE_Q3_KXS: bs = sizeof(block_q3_K); blk = QK_K; break;
+        case GGML_TYPE_IQ3_XXS: bs = sizeof(block_iq3_xxs); blk = QK_K; break;
         case GGML_TYPE_IQ2_XS: bs = sizeof(block_iq2_xs); blk = QK_K; break;
         case GGML_TYPE_IQ2_S:  bs = sizeof(block_iq2_s);  blk = QK_K; break;
+        case GGML_TYPE_IQ4_XS: bs = sizeof(block_iq4_xs); blk = QK_K; break;
         case GGML_TYPE_Q2_K: bs = sizeof(block_q2_K); blk = QK_K; break;
         default:
             /* tolerated: see main-loader comment (MTP layer etc.) */
@@ -887,29 +931,38 @@ int qma_align_model(const char *src, char *use_path, size_t use_len, char *err, 
             free(buf); gguf_scan_free(&s);
             return -1;
         }
-        /* compare the head of tensor 0 and the last tensor, byte-for-byte,
-           between source and repacked file (catches wrong-source copies) */
+        /* verify EVERY tensor's head bytes between source and repacked
+           file (the old 2-tensor spot check missed mid-file corruption). */
         int bad = 0;
         int vfd = open(cand, O_RDONLY);
-        if (vfd < 0) { bad = 1; }
+        const size_t vds_ok = (v.infos_end + v.alignment - 1) / v.alignment * v.alignment;
+        uint8_t *b2 = NULL;
+        if (vfd < 0) bad = 1;
         else {
-            const size_t vds = (v.infos_end + v.alignment - 1) / v.alignment * v.alignment;
-            const uint32_t picks[2] = { 0, s.n_tensors - 1 };
-            for (int k = 0; k < 2 && !bad; k++) {
-                const uint32_t i = picks[k];
-                const size_t nb = s.nbytes[i];
-                const size_t chk = nb < (1u << 20) ? nb : (1u << 20);
-                if (nb == 0) continue;
-                if (pread(in, buf, chk, (off_t)(old_ds + s.off[i])) != (ssize_t)chk) { bad = 1; break; }
-                uint8_t *b2 = malloc(chk);
-                if (!b2) { bad = 1; break; }
-                if (pread(vfd, b2, chk, (off_t)(vds + v.off[i])) != (ssize_t)chk) { free(b2); bad = 1; break; }
-                if (memcmp(buf, b2, chk) != 0) { free(b2); bad = 1; break; }
-                free(b2);
-            }
-            close(vfd);
+            b2 = malloc(1u << 16);
+            if (!b2) bad = 1;
         }
-        if (bad) {
+        int nmis = 0;
+        for (uint32_t i = 0; !bad && b2 && i < s.n_tensors; i++) {
+            const size_t nb = s.nbytes[i];
+            if (nb == 0) continue;
+            const size_t chk = nb < (1u << 16) ? nb : (1u << 16);
+            if (pread(in, buf, chk, (off_t)(old_ds + s.off[i])) != (ssize_t)chk) { nmis++; continue; }
+            if (pread(vfd, b2, chk, (off_t)(vds_ok + v.off[i])) != (ssize_t)chk) { nmis++; continue; }
+            if (memcmp(buf, b2, chk) != 0) {
+                nmis++;
+                if (nmis <= 10)
+                    fprintf(stderr, "qma: align VERIFY FAIL tensor %u "
+                            "(src off %zu dst off %zu, %zu bytes)\n",
+                            i, s.off[i], v.off[i], nb);
+            }
+        }
+        if (b2) free(b2);
+        if (vfd >= 0) close(vfd);
+        if (!bad && nmis)
+            fprintf(stderr, "qma: align VERIFY: %d/%u tensors mismatched — rejecting\n",
+                    nmis, s.n_tensors);
+        if (nmis > 0 || bad) {
             snprintf(err, errlen, "aligned model data mismatch — keeping %s", src);
             unlink(cand);
             gguf_scan_free(&v);

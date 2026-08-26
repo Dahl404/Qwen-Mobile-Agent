@@ -541,6 +541,8 @@ static float dot_w_f32(int wtype, const uint8_t *wr, const float *xp, int n) {
     case GGML_TYPE_Q3_K:   return dot_q3_K_f32((const block_q3_K *)wr, xp, n);
     case GGML_TYPE_IQ2_XS: return dot_iq2_xs_f32((const block_iq2_xs *)wr, xp, n);
     case GGML_TYPE_IQ2_S:  return dot_iq2_s_f32((const block_iq2_s *)wr, xp, n);
+    case GGML_TYPE_IQ3_XXS:return dot_iq3_xxs_f32((const block_iq3_xxs *)wr, xp, n);
+    case GGML_TYPE_IQ4_XS: return dot_iq4_xs_f32((const block_iq4_xs *)wr, xp, n);
     case GGML_TYPE_Q8_0:   return dot_q8_0_f32(wr, xp, n);
     default:               return 0.0f;
     }
@@ -865,6 +867,8 @@ static void moe_ffn(qma_t *m, int il, const float *x, const float *r_l, float *o
 
 /* MoE phase timers (aggregated us; exposed for harnesses/profiles) */
 double g_moe_fetch_us = 0, g_moe_comp_us = 0, g_moe_fetched = 0;
+static int g_nancheck = -1;
+static int g_nanil = -1;
 void qma_moe_timers_reset(void) { g_moe_fetch_us = g_moe_comp_us = g_moe_fetched = 0; }
 
 /* one (token, expert) task: fetch the record, compute the weighted partial */
@@ -934,6 +938,21 @@ static void moe_xpar_worker(void *arg, int b, int e)
         double tc = now_s();
         if (xa->q8k) {
             int8_t gq[N_FF_EXP]; float gd[N_FF_EXP / QK_K]; int16_t gs[N_FF_EXP / 16];
+            /* pre-check: is the accumulator slot already poisoned? */
+            if (g_nanil == il) {
+                static int pre_logged = 0;
+                if (!pre_logged) {
+                    for (int i = 0; i < N_EMBD; i++) {
+                        if (!isfinite(acc[i])) {
+                            fprintf(stderr, "qma: NANPRE il=%d tok=%d ex=%d k=%d "
+                                    "(accumulator stale-poisoned BEFORE expert add)\n",
+                                    il, t, ex, k);
+                            pre_logged = 1;
+                            break;
+                        }
+                    }
+                }
+            }
             moe_expert_one_q8k(ge, ue, de,
                                m->layers[il].t_gate_exps, m->layers[il].t_up_exps,
                                m->layers[il].t_down_exps,
@@ -941,6 +960,33 @@ static void moe_xpar_worker(void *arg, int b, int e)
                                xa->xd + (size_t)t * (N_EMBD / QK_K),
                                xa->xsum + (size_t)t * (N_EMBD / 16),
                                we, gq, gd, gs, acc);
+            /* QMA_NANIL=<layer>: catch the first (token,expert) whose
+               partial goes non-finite and dump its raw weight record */
+            if (g_nanil == il) {
+                int nb_ = 0;
+                for (int i = 0; i < N_EMBD; i++)
+                    if (!isfinite(acc[i])) { nb_ = 1; break; }
+                if (nb_) {
+                    static int dumped = 0;
+                    fprintf(stderr, "qma: NANEXPERT il=%d tok=%d ex=%d k=%d "
+                            "ge=%zu ue=%zu dn=%zu\n", il, t, ex, k,
+                            ge_bytes, ue_bytes, dn);
+                    if (!dumped) {
+                        FILE *f = fopen("bad_expert.bin", "wb");
+                        if (f) { fwrite(ge, 1, ge_bytes + ue_bytes + dn, f); fclose(f); }
+                        FILE *g = fopen("bad_act.bin", "wb");
+                        if (g) {
+                            fwrite(xa->xq + (size_t)t * N_EMBD, 1, N_EMBD, g);
+                            fwrite(xa->xd + (size_t)t * (N_EMBD / QK_K),
+                                   sizeof(float), N_EMBD / QK_K, g);
+                            fwrite(xa->xsum + (size_t)t * (N_EMBD / 16),
+                                   sizeof(int16_t), N_EMBD / 16, g);
+                            fclose(g);
+                        }
+                        dumped = 1;
+                    }
+                }
+            }
         } else {
             moe_expert_one(ge, ue, de,
                            m->layers[il].t_gate_exps, m->layers[il].t_up_exps,
@@ -2549,6 +2595,8 @@ static void embed_row(qma_t *m, int id, float *out) {
     case GGML_TYPE_Q3_K:   dequantize_row_q3_K((const block_q3_K *)row, out, N_EMBD); break;
     case GGML_TYPE_IQ2_XS: dequantize_row_iq2_xs((const block_iq2_xs *)row, out, N_EMBD); break;
     case GGML_TYPE_IQ2_S:  dequantize_row_iq2_s((const block_iq2_s *)row, out, N_EMBD); break;
+    case GGML_TYPE_IQ3_XXS:dequantize_row_iq3_xxs((const block_iq3_xxs *)row, out, N_EMBD); break;
+    case GGML_TYPE_IQ4_XS: dequantize_row_iq4_xs((const block_iq4_xs *)row, out, N_EMBD); break;
     case GGML_TYPE_Q8_0:   dequantize_row_q8_0(row, out, N_EMBD); break;
     default:               memset(out, 0, N_EMBD * sizeof(float)); break;
     }
@@ -2558,6 +2606,8 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
                 float *logits, int n_threads, int prefetch, int logits_all) {
     g_pf_dist = prefetch;
     if (g_pf_trace < 0) g_pf_trace = getenv("QMA_PFTRACE") != NULL;
+    if (g_nancheck < 0) g_nancheck = getenv("QMA_NANCHECK") != NULL;
+    if (g_nanil < 0) { const char *e = getenv("QMA_NANIL"); g_nanil = e ? atoi(e) : -1; }
     pool_init(n_threads);
     g_prof_cache = &m->ecache;
     timing_init();
@@ -2771,6 +2821,16 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
 
             /* residual + MoE FFN (256 experts top-8 + shared expert) */
             add_m(s.x2, s.ra, s.x, N_EMBD, T);
+            if (g_nancheck) {
+                float mx = 0.f; int bad = 0;
+                for (int i = 0; i < N_EMBD * T; i++) {
+                    float v = s.x2[i];
+                    if (!isfinite(v)) { bad = 1; break; }
+                    float a = fabsf(v); if (a > mx) mx = a;
+                }
+                if (bad || mx > 1e5f)
+                    fprintf(stderr, "qma: NANCHECK pre-moe il=%d max=%g nonfinite=%d\n", il, mx, bad);
+            }
             rms_norm_m(s.xn, s.x2, (const float *)m->layers[il].attn_post_norm, N_EMBD, T, RMS_EPS);
             { double tM0 = now_s();
               moe_ffn(m, il, s.xn, s.x2, s.ra, T);
@@ -2798,6 +2858,21 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
                 double dtM = t_acc[0] - tM;   /* matmul ms added during this layer */
                 tM = t_acc[0];
                 timing_add(6, now_s() - tL0 - dtM - tN - tA - tC - tG);
+            }
+
+            /* QMA_NANCHECK=1: per-layer residual sanity — pinpoints which
+             * layer first injects non-finite/huge values (mixed-quant
+             * debugging). */
+            if (g_nancheck) {
+                float mx = 0.f; int bad = 0;
+                for (int i = 0; i < N_EMBD * T; i++) {
+                    float v = s.x[i];
+                    if (!isfinite(v)) { bad = 1; break; }
+                    float a = fabsf(v); if (a > mx) mx = a;
+                }
+                if (bad || mx > 1e5f)
+                    fprintf(stderr, "qma: NANCHECK il=%d max=%g nonfinite=%d\n",
+                            il, mx, bad);
             }
         }
 

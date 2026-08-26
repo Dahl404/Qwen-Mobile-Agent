@@ -487,6 +487,10 @@ float qma_q8k_dot(const void *row, int wtype, const int8_t *xq,
         return qma_dot_iq2_xs_q8k((const block_iq2_xs *)row, xq, xd, n);
     if (wtype == GGML_TYPE_IQ2_S)
         return qma_dot_iq2_s_q8k((const block_iq2_s *)row, xq, xd, n);
+    if (wtype == GGML_TYPE_IQ3_XXS)
+        return qma_dot_iq3_xxs_q8k((const block_iq3_xxs *)row, xq, xd, n);
+    if (wtype == GGML_TYPE_IQ4_XS)
+        return qma_dot_iq4_xs_q8k((const block_iq4_xs *)row, xq, xd, n);
     if (wtype == GGML_TYPE_Q8_0)
         return qma_dot_q8_0_q8k(row, xq, xd, n);
 #endif

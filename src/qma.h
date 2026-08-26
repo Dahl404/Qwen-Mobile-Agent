@@ -64,16 +64,24 @@
 #define N_ATTN_LAYER  10
 
 /* ---------- quant type constants ---------- */
+/* NOTE: these ids MUST match the GGUF/llama.cpp enum exactly — they are
+   file format ids, not internal numbers. Earlier this table had IQ2_S=23
+   and "Q3_KXS"=18 (Q3_K layout); the real enum is IQ3_XXS=18 (98 B),
+   IQ2_S=22 (82 B), IQ4_XS=23 (136 B). The Unsloth UD-Q2_K_XL file uses
+   IQ3_XXS and IQ4_XS for its down-exps; the wrong mapping made qma decode
+   those slabs with the wrong block layout and wrong expert stride
+   (gibberish/NaN). */
 #define GGML_TYPE_F32   0
 #define GGML_TYPE_Q4_K  12
 #define GGML_TYPE_Q5_K  13
 #define GGML_TYPE_Q6_K  14
 #define GGML_TYPE_Q3_K  11
-#define GGML_TYPE_Q3_KXS 18   /* same block layout as Q3_K, distinct id */
 #define GGML_TYPE_Q2_K  10
 #define GGML_TYPE_BF16  30
 #define GGML_TYPE_IQ2_XS 17
-#define GGML_TYPE_IQ2_S  23
+#define GGML_TYPE_IQ3_XXS 18   /* 98 B/block: d(2) + qs[3*QK_K/8] */
+#define GGML_TYPE_IQ2_S 22     /* 82 B/block */
+#define GGML_TYPE_IQ4_XS 23    /* 136 B/block: d + scales_h + scales_l + qs */
 #define GGML_TYPE_Q8_0   8
 
 /* Q4_K: 256 weights per super-block, 8 sub-blocks of 32, 6-bit scales.
@@ -149,6 +157,23 @@ typedef struct {
     uint8_t  scales[QK_K/32];
 } block_iq2_s;
 
+/* IQ3_XXS: 98 B / 256 w — d(2) + 96 bytes of 3-bit grid indices.
+ * Dequant reads 8-bit indices into iq3xxs_grid + 4-bit scales packed in
+ * the top nibble of each 32-bit group of the qs tail. */
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[3*QK_K/8];        /* 96 bytes */
+} block_iq3_xxs;
+
+/* IQ4_XS: 136 B / 256 w — d(2) + scales_h(2) + scales_l(4) + qs(128).
+ * 32 4-bit weights per sub-block, nonlinear 4-bit codebook (kvalues_iq4nl). */
+typedef struct {
+    uint16_t d;
+    uint16_t scales_h;
+    uint8_t  scales_l[QK_K/64];   /* 4 bytes */
+    uint8_t  qs[QK_K/2];          /* 128 bytes */
+} block_iq4_xs;
+
 /* byte size of one QK_K super-block of a supported weight type
  * (0 = unsupported). Single source of truth — all row/slab math routes
  * through this so mixed-quant models stay consistent. */
@@ -158,11 +183,12 @@ static inline size_t qma_blk_size(int type) {
     case GGML_TYPE_Q5_K:  return sizeof(block_q5_K);   /* 176 */
     case GGML_TYPE_Q6_K:  return sizeof(block_q6_K);   /* 210 */
     case GGML_TYPE_Q3_K:  return sizeof(block_q3_K);   /* 110 */
-    case GGML_TYPE_Q3_KXS:return sizeof(block_q3_K);   /* same layout */
+    case GGML_TYPE_IQ3_XXS:return sizeof(block_iq3_xxs);/* 98  */
     case GGML_TYPE_Q2_K:  return sizeof(block_q2_K);   /* 84  */
     case GGML_TYPE_Q8_0:  return sizeof(block_q8_0) * (QK_K/QK8_0); /* 272 */
     case GGML_TYPE_IQ2_XS:return sizeof(block_iq2_xs); /* 74  */
     case GGML_TYPE_IQ2_S: return sizeof(block_iq2_s);  /* 82  */
+    case GGML_TYPE_IQ4_XS:return sizeof(block_iq4_xs); /* 136 */
     default:              return 0;
     }
 }
@@ -437,6 +463,8 @@ void     dequantize_row_q5_K(const block_q5_K *x, float *y, int64_t k);
 void     dequantize_row_q3_K(const block_q3_K *x, float *y, int64_t k);
 void     dequantize_row_iq2_xs(const block_iq2_xs *x, float *y, int64_t k);
 void     dequantize_row_iq2_s(const block_iq2_s *x, float *y, int64_t k);
+void     dequantize_row_iq3_xxs(const block_iq3_xxs *x, float *y, int64_t k);
+void     dequantize_row_iq4_xs(const block_iq4_xs *x, float *y, int64_t k);
 float    dot_q4_K_f32(const block_q4_K *W, const float *x, int n);
 float    dot_q6_K_f32(const block_q6_K *W, const float *x, int n);
 void     dequantize_row_q8_0(const void *x, float *y, int64_t k);
@@ -447,6 +475,8 @@ float    dot_q5_K_f32(const block_q5_K *W, const float *x, int n);
 float    dot_q3_K_f32(const block_q3_K *W, const float *x, int n);
 float    dot_iq2_xs_f32(const block_iq2_xs *W, const float *x, int n);
 float    dot_iq2_s_f32(const block_iq2_s *W, const float *x, int n);
+float    dot_iq3_xxs_f32(const block_iq3_xxs *W, const float *x, int n);
+float    dot_iq4_xs_f32(const block_iq4_xs *W, const float *x, int n);
 
 /* quantize row of floats to q8_0 blocks (k must be multiple of 32) */
 void     quantize_row_q8_0(const float *x, block_q8_0 *y, int64_t k);
@@ -466,6 +496,10 @@ float    qma_dot_iq2_xs_q8k(const block_iq2_xs *b, const int8_t *xq,
                             const float *xd, int n);
 float    qma_dot_iq2_s_q8k(const block_iq2_s *b, const int8_t *xq,
                            const float *xd, int n);
+float    qma_dot_iq3_xxs_q8k(const block_iq3_xxs *b, const int8_t *xq,
+                             const float *xd, int n);
+float    qma_dot_iq4_xs_q8k(const block_iq4_xs *b, const int8_t *xq,
+                            const float *xd, int n);
 /* fused gate+up: two Q4_K rows, one pass over the shared activation */
 void     qma_q8k_gateup(const void *g, const void *u, const int8_t *xq,
                            const float *xd, const int16_t *xsum, int n,

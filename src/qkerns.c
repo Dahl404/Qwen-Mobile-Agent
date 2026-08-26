@@ -214,6 +214,86 @@ float dot_iq2_s_f32(const block_iq2_s *W, const float *x, int n) {
     return total;
 }
 
+/* ===================== IQ3_XXS (98 B/block) ===================== */
+/* 3-bit grid indices (8-bit table lookups), 4-bit scales packed in the
+   high nibble of each 32-bit group of the qs tail, signs via ksigns. */
+
+void dequantize_row_iq3_xxs(const block_iq3_xxs *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = half_to_float(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *scales_and_signs = qs + QK_K / 4;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            uint32_t aux32;
+            memcpy(&aux32, scales_and_signs + 4 * ib32, 4);
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * l) & 127];
+                const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 0]);
+                const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 1]);
+                for (int j = 0; j < 4; ++j) {
+                    y[j + 0] = db * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+                    y[j + 4] = db * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+                }
+                y += 8;
+            }
+            qs += 8;
+        }
+    }
+}
+
+float dot_iq3_xxs_f32(const block_iq3_xxs *W, const float *x, int n) {
+    const int nb = n / QK_K;
+    float total = 0.f;
+    static _Thread_local float buf[QK_K];
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_iq3_xxs(&W[i], buf, QK_K);
+        const float *xp = x + (size_t)i * QK_K;
+        float sum = 0.f;
+        for (int j = 0; j < QK_K; j++) sum += buf[j] * xp[j];
+        total += sum;
+    }
+    return total;
+}
+
+/* ===================== IQ4_XS (136 B/block) ===================== */
+/* 32 4-bit nonlinear codebook values per sub-block; 8-bit scales.
+   scale ls = (scales_l nibble) | ((scales_h bits) << 4); dl = d*(ls-32). */
+
+void dequantize_row_iq4_xs(const block_iq4_xs *x, float *y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int64_t i = 0; i < nb; i++) {
+        const uint8_t *qs = x[i].qs;
+        const float d = half_to_float(x[i].d);
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const int ls = ((x[i].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) |
+                           (((x[i].scales_h >> 2 * ib) & 3) << 4);
+            const float dl = d * (ls - 32);
+            for (int j = 0; j < 16; ++j) {
+                y[j +  0] = dl * kvalues_iq4nl[qs[j] & 0xf];
+                y[j + 16] = dl * kvalues_iq4nl[qs[j] >> 4];
+            }
+            y += 32;
+            qs += 16;
+        }
+    }
+}
+
+float dot_iq4_xs_f32(const block_iq4_xs *W, const float *x, int n) {
+    const int nb = n / QK_K;
+    float total = 0.f;
+    static _Thread_local float buf[QK_K];
+    for (int i = 0; i < nb; i++) {
+        dequantize_row_iq4_xs(&W[i], buf, QK_K);
+        const float *xp = x + (size_t)i * QK_K;
+        float sum = 0.f;
+        for (int j = 0; j < QK_K; j++) sum += buf[j] * xp[j];
+        total += sum;
+    }
+    return total;
+}
+
 /* ===================== q8k SDOT kernels ===================== */
 
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -494,6 +574,86 @@ float qma_dot_q8_0_q8k(const void *wv, const int8_t *xq,
                                           vld1q_s8(xq));
             acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p), d * xdb);
             xq += QK8_0;
+        }
+        total += vaddvq_f32(acc);
+    }
+    return total;
+}
+#endif /* __ARM_FEATURE_DOTPROD */
+
+#if defined(__ARM_FEATURE_DOTPROD)
+/* q8k SDOT: dequant each sub-block to int8 grid values once, then dot with
+   the q8k activation using DOTPROD. Matches the IQ2_S kernel's shape. */
+float qma_dot_iq3_xxs_q8k(const block_iq3_xxs *b, const int8_t *xq,
+                          const float *xd, int cols)
+{
+    const int nb = cols / QK_K;
+    float total = 0.f;
+    for (int i = 0; i < nb; i++) {
+        const float d = half_to_float(b[i].d);
+        const float xdb = xd[i];
+        const int8_t *xp = xq + (size_t)i * QK_K;
+        const uint8_t *qs = b[i].qs;
+        const uint8_t *scales_and_signs = qs + QK_K / 4;
+        float32x4_t acc = vdupq_n_f32(0.f);
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            uint32_t aux32;
+            memcpy(&aux32, scales_and_signs + 4 * ib32, 4);
+            const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * l) & 127];
+                const uint8_t *g1 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 0]);
+                const uint8_t *g2 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 1]);
+                int8_t w[8];   /* exactly 8 weights per l */
+                for (int j = 0; j < 4; ++j) {
+                    w[j]     = (int8_t)(signs & kmask_iq2xs[j + 0] ? -g1[j] : g1[j]);
+                    w[j + 4] = (int8_t)(signs & kmask_iq2xs[j + 4] ? -g2[j] : g2[j]);
+                }
+                /* 64-bit loads: read exactly 8 bytes, zero-pad to 128-bit
+                   lanes. A 128-bit load here would read 8 bytes past the
+                   row's final block (activation buffers are 256-aligned
+                   per block, not padded after the last block). */
+                int8x8_t wv = vld1_s8(w);
+                int8x8_t xv = vld1_s8(xp);
+                int32x4_t p = vdotq_s32(vdupq_n_s32(0),
+                                        vcombine_s8(wv, vdup_n_s8(0)),
+                                        vcombine_s8(xv, vdup_n_s8(0)));
+                acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p), db * xdb);
+                xp += 8;
+            }
+            qs += 8;
+        }
+        total += vaddvq_f32(acc);
+    }
+    return total;
+}
+
+float qma_dot_iq4_xs_q8k(const block_iq4_xs *b, const int8_t *xq,
+                         const float *xd, int cols)
+{
+    const int nb = cols / QK_K;
+    float total = 0.f;
+    for (int i = 0; i < nb; i++) {
+        const float d = half_to_float(b[i].d);
+        const float xdb = xd[i];
+        const int8_t *xp = xq + (size_t)i * QK_K;
+        const uint8_t *qs = b[i].qs;
+        float32x4_t acc = vdupq_n_f32(0.f);
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const int ls = ((b[i].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) |
+                           (((b[i].scales_h >> 2 * ib) & 3) << 4);
+            const float dl = d * (ls - 32) * xdb;
+            int8_t w[32];
+            for (int j = 0; j < 16; ++j) {
+                w[j]      = kvalues_iq4nl[qs[j] & 0xf];
+                w[j + 16] = kvalues_iq4nl[qs[j] >> 4];
+            }
+            int32x4_t p0 = vdotq_s32(vdupq_n_s32(0), vld1q_s8(w),      vld1q_s8(xp));
+            int32x4_t p1 = vdotq_s32(vdupq_n_s32(0), vld1q_s8(w + 16), vld1q_s8(xp + 16));
+            acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p0), dl);
+            acc = vfmaq_n_f32(acc, vcvtq_f32_s32(p1), dl);
+            xp += 32;
+            qs += 16;
         }
         total += vaddvq_f32(acc);
     }
