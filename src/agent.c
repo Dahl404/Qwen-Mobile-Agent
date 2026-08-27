@@ -39,7 +39,7 @@
 static const char *DEFAULT_MODEL = "/data/data/com.termux/files/home/projects/models/qwen3.6:35b:a3b-q4km.gguf.4k";
 
 /* ---- config ---- */
-static int g_threads = 8, g_ctx = 65536, g_prefetch = 4;
+static int g_threads = 8, g_ctx = 1000000, g_prefetch = 4;
 static float g_temp = 0.8f, g_top_p = 0.95f, g_repeat = 1.1f;
 static int g_top_k = 20;
 static float g_eos_penalty = 1.5f;
@@ -1848,7 +1848,7 @@ static void usage(const char *prog) {
         "  -m <path>     model file (default: %s, else ~/.qma/config)\n"
         "  -p <prompt>   one-shot prompt (default: interactive)\n"
         "  -t <n>        threads (default 8)\n"
-        "  -c <n>        ring context size (default 65536)\n"
+        "  -c <n>        ring context size (default 1000000)\n"
         "  --temp <f>    temperature (default 0.8)\n"
         "  --repeat <f>  repeat penalty (default 1.1)\n"
         "  --eos-penalty <f>  control-token logit penalty (default 1.5)\n"

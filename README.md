@@ -39,17 +39,14 @@ reads ahead of time on background threads so the matmuls for expert N+1 don't
 have to wait for expert N+1's weights to arrive from disk. Setting `--ecache
 0` switches to plain mmap instead.
 
-**Tiered context memory.** The KV cache — the running memory of everything
-said so far — is stored in a fixed-size ring buffer, but the model behaves as
-if its memory is unbounded. Every token position has a running score (an
-exponential moving average of how much attention it has received). The first
-few tokens are always kept (a small fixed "sink"), the most recent several
-thousand tokens are kept at full precision, a wider window behind that is
-kept at lower precision, and a small set of high-scoring tokens from
-anywhere in the conversation — "heavy hitters" — get copied out of the ring
-into a protected slot so they survive being overwritten by newer tokens as
-long as they keep scoring well. Tokens that fall out of every tier simply
-aren't attended to. In effect, a long conversation keeps only what mattered.
+**Streamed Context & Agent Archive.** The KV cache is stored in a 1M-token
+ring buffer backed by a sparse, memory-mapped file (`MAP_SHARED`), ensuring
+physical RAM usage is strictly bounded only by the pages attention currently
+touches. Attention attends to all valid context across the ring buffer without
+heuristic token eviction. On top of this, the agent can pin permanent facts
+via the `memory_write` / `memory_append` / `memory_list` / `memory_delete` /
+`memory_clear` tools, which write key-value pairs into a protected archive
+arena (`hcm_arc_kv`) attended on every step across session restarts.
 
 **Agent archive — the model's own active memory.** On top of the tiered
 cache, the agent can pin anything it wants permanent: the `memory_write` /
@@ -205,7 +202,7 @@ qma -p "prompt"            one-shot, non-interactive
 | `-m <path>` | path to the `.gguf` model file (else `~/.qma/config`, else it prompts) |
 | `-p <prompt>` | run one prompt and exit, instead of an interactive session |
 | `-t <n>` | number of threads (default 8) |
-| `-c <n>` | ring context size in tokens (default 65536) |
+| `-c <n>` | ring context size in tokens (default 1000000) |
 | `--temp <f>` | sampling temperature (default 0.8) |
 | `--repeat <f>` | repeat penalty (default 1.1) |
 | `--eos-penalty <f>` | penalty applied to control-token logits (default 1.5) |

@@ -1167,87 +1167,39 @@ typedef struct {
     const float *Q, *K, *V, *gate;
     float *out, *cache;
     int T, n_ctx, n_pos;
-    int lay;      /* attention layer index (salience array) */
     int n_live;   /* live positions to attend (hcm_live[0..n_live)) */
-    int n4;       /* end of all q4: hcm_live[0..n4) q4, [n4..n_live) q2 */
-    int n_ring_q4;/* hcm_live[0..n_ring_q4) ring slots, [n_ring_q4..n4) arena */
-    int rebuilt_at; /* n_pos when hcm_live was built; positions in
-                       [rebuilt_at, n_pos) were appended since and must be
-                       attended directly (they are not in the live index) */
-    const uint8_t *pin_kv;  /* this layer's H2O arena (NULL if unused) */
+    int n_ring_q4;/* hcm_live[0..n_ring_q4) ring slots, [n_ring_q4..n_live) archive */
     const uint8_t *arc_kv;  /* this layer's agent archive arena (NULL if unused) */
 } attn_ctx;
 
-/* ---- hierarchical context memory (H2O-style eviction + salience EMA) ----
- * Default ON. The KV cache stays append-only in the file; a "live index"
- * selects which positions attention actually reads each maintenance pass:
- *   sink (first 4, StreamingLLM) + hot window (last W_HOT) + pinned
- *   heavy-hitters (top HCM_H_PIN by accumulated attention mass, H2O).
- * Every position's salience is the EMA of softmax mass it received, updated
- * in attn_worker where scores are already computed — no extra model needed.
- * Tokens that fall out of every tier are simply not attended (not needed).
- * Toggle off with QMA_NOEVICT=1. */
-#define HCM_W_HOT     4096   /* q4 recent window (KIVI: crucial, now q4)     */
-#define HCM_H_PIN     2048   /* heavy-hitter budget (H2O: ~20% but cap small) */
-#define HCM_W_GIST    32768  /* q2 gist window beyond hot (larger ctx pre-eviction) */
-#define HCM_SINK      4      /* attention sinks (StreamingLLM: 4 tokens)      */
-#define HCM_ALPHA     0.05f  /* salience EMA rate (~20-token half-life)        */
-#define HCM_QF_BIAS   2.0f   /* Q-Hitter: weight of quantization-friendliness in
-                                 pin selection (qf is relative error ~0.05)      */
-#define HCM_REBUILD   128    /* re-rank every N tokens (amortized O(n/K))      */
-/* Static ring: n_ctx is the FIXED working size (sink reserved, everything
-   after wraps modulo n_ctx-HCM_SINK). The ring turning is the eviction:
-   n_pos grows forever, old slots get recycled by new tokens, and the KV
-   allocation stays constant — a Shepard-tone, perceived-infinite context.
-   The live set (sink+hot+pinned+gist ~39K) always fits inside the ring
-   (default n_ctx=65536), so no live position is ever recycled while live. */
-static inline int hcm_slot(int p, int n_ctx) {
-    if (p < HCM_SINK) return p;                    /* sinks: never recycled */
-    return HCM_SINK + (p - HCM_SINK) % (n_ctx - HCM_SINK);
-}
-static int hcm_on = -1;      /* -1 = detect env, then 0/1 */
-static int kvq_on = -1;      /* -1 = detect env (QMA_KVQ=0 disables), then 0/1 */
-static int kvqi8_on = -1;    /* QMA_KVQI8=0 -> fp32-expansion score kernel */
-static float *hcm_sal[N_ATTN_LAYER];   /* [lay][n_ctx] accumulated mass (ring slots) */
-static float *hcm_qf;                   /* [n_ctx] Q-Hitter quantization friendliness
-                                           (lower = quantizes better; 0 = unknown) */
-static int    *hcm_live;               /* [n_ctx] live index; >= n_ctx encodes arena */
-static uint8_t *hcm_tier;              /* [n_ctx] 0=evicted 1=q2 2=q4    */
-static int     hcm_live_n = 0;         /* entries in hcm_live             */
-static int     hcm_n4 = 0;             /* end of all q4 (ring+arena)       */
-static int     hcm_n_ring_q4 = 0;      /* end of ring-q4 segment (start of arena) */
-static int     hcm_rebuilt_at = 0;     /* n_pos when hcm_live was last built */
-static int     hcm_ctx_cap = 0;        /* capacity (== n_ctx)             */
-static int     hcm_next_rebuild = HCM_REBUILD;
-
-/* ---- H2O heavy-hitter arena (protected, outside the ring) ----
- * Pinned heavy hitters are COPIED out of the ring into this arena, exactly
- * as H2O's paper does ("first K entries as heavy hitters, last K as most
- * recent"). Because the KV lives outside the ring, ring recycling can never
- * overwrite a pinned fact — it survives arbitrarily long, as long as it
- * keeps ranking in the top-HCM_H_PIN by accumulated attention. LRU-by-salience
- * replacement within the arena. */
-static uint8_t *hcm_pin_kv[N_ATTN_LAYER];   /* [lay][2*N_HEAD_KV][HCM_H_PIN][KVQ_SLOT] */
-static int32_t  hcm_pin_pos[HCM_H_PIN];         /* absolute pos in arena slot, -1 empty */
-static float    hcm_pin_sal[N_ATTN_LAYER][HCM_H_PIN]; /* salience per (lay, slot) */
-static int      hcm_pin_n = 0;              /* occupied arena slots */
-#define HCM_ARENA_BASE (1 << 24)   /* hcm_live values >= this encode arena idx */
-
-/* ---- agent archive (the manually-edited memory ring) ----
- * On top of the salience arena, the AGENT can pin text itself via the
- * memory_* tools: real K/V computed by a short eval, stored in a separate
- * protected arena, attended every token, never evicted by the salience
- * competition, surviving ring wrap and restarts (rebuilt from memory.json
- * at boot). This is what makes long-term consolidation reliable: the model
- * decides what is permanent instead of trusting a salience heuristic. */
+/* ---- SIMPLE KV RING + AGENT ARCHIVE (no eviction, no salience) ----
+ * - KV cache is a fixed-size ring buffer (n_ctx slots).
+ *   n_pos grows forever; slot = n_pos % n_ctx. Old slots are overwritten.
+ *   Attention attends to ALL valid positions [0, n_pos] via ring mapping.
+ * - Agent archive (memory_* tools): pinned KV in separate arena, always
+ *   attended, survives ring wrap and restarts (rebuilt from memory.json).
+ * - No salience, no hot window, no heavy hitters, no q2 tier, no rebuild.
+ */
 #define HCM_ARC_MAX     1024    /* agent archive positions */
 #define HCM_ARC_ENTRIES 64      /* max distinct memory entries */
-#define HCM_ARC_BASE (1 << 25)  /* hcm_live encoding for agent-archive entries */
+#define HCM_ARC_BASE    (1 << 25)  /* hcm_live values >= this encode archive entries */
 typedef struct { int32_t pos, n, abs0; uint64_t ts; char key[64]; } hcm_arc_ent_t;
 static uint8_t      *hcm_arc_kv[N_ATTN_LAYER];   /* [lay][2*N_HEAD_KV][HCM_ARC_MAX][KVQ_SLOT] */
 static hcm_arc_ent_t hcm_arc_ent[HCM_ARC_ENTRIES];
 static int           hcm_arc_nent = 0;
 static int           hcm_arc_n = 0;              /* arena append pointer */
+static int           hcm_rebuilt_at = -1;        /* last n_pos when hcm_live was rebuilt */
+static int          *hcm_live = NULL;            /* live index: ring slots + archive entries */
+static int           hcm_live_n = 0;
+static int           hcm_n_ring_q4 = 0;
+static int           hcm_n4 = 0;
+
+static inline int hcm_slot(int p, int n_ctx) {
+    return p % n_ctx;
+}
+
+static int kvq_on = -1;      /* -1 = detect env (QMA_KVQ=0 disables), then 0/1 */
+static int kvqi8_on = -1;    /* QMA_KVQI8=0 -> fp32-expansion score kernel */
 
 int qma_kvq_on(void) {
     if (kvq_on < 0) {
@@ -1258,188 +1210,31 @@ int qma_kvq_on(void) {
 }
 
 static void hcm_init(int n_ctx) {
-    if (hcm_on < 0) hcm_on = getenv("QMA_NOEVICT") == NULL;
-    if (!hcm_on) return;
-    if (n_ctx > hcm_ctx_cap) {
-        for (int l = 0; l < N_ATTN_LAYER; l++) {
-            free(hcm_sal[l]);
-            hcm_sal[l] = calloc((size_t)n_ctx, sizeof(float));
-        }
-        free(hcm_live);
-        hcm_live = malloc((size_t)n_ctx * sizeof(int));
-        free(hcm_tier);
-        hcm_tier = calloc((size_t)n_ctx, 1);   /* default q4 (2) for new pos */
-        free(hcm_qf);
-        hcm_qf = calloc((size_t)n_ctx, sizeof(float));
-        /* H2O heavy-hitter arena: protected KV outside the ring */
-        for (int l = 0; l < N_ATTN_LAYER; l++) {
-            free(hcm_pin_kv[l]);
-            hcm_pin_kv[l] = calloc((size_t)2 * N_HEAD_KV * HCM_H_PIN, KVQ_SLOT);
-            /* agent archive arena (separate, agent-owned) */
-            free(hcm_arc_kv[l]);
-            hcm_arc_kv[l] = calloc((size_t)2 * N_HEAD_KV * HCM_ARC_MAX, KVQ_SLOT);
-        }
-        memset(hcm_pin_pos, -1, sizeof(hcm_pin_pos));
-        memset(hcm_pin_sal, 0, sizeof(hcm_pin_sal));
-        memset(hcm_arc_ent, 0, sizeof(hcm_arc_ent));
-        hcm_arc_nent = 0;
-        hcm_arc_n = 0;
-        hcm_pin_n = 0;
-        hcm_ctx_cap = n_ctx;
+    /* Allocate live index array (max n_ctx ring slots + HCM_ARC_MAX archive) */
+    free(hcm_live);
+    hcm_live = malloc(((size_t)n_ctx + HCM_ARC_MAX) * sizeof(int));
+    /* Agent archive arena: protected KV outside the ring */
+    for (int l = 0; l < N_ATTN_LAYER; l++) {
+        free(hcm_arc_kv[l]);
+        hcm_arc_kv[l] = calloc((size_t)2 * N_HEAD_KV * HCM_ARC_MAX, KVQ_SLOT);
     }
+    memset(hcm_arc_ent, 0, sizeof(hcm_arc_ent));
+    hcm_arc_nent = 0;
+    hcm_arc_n = 0;
+    hcm_rebuilt_at = -1;
 }
 
-/* rebuild the live index: sink + hot window + pinned heavy-hitters (q4)
-   + q2 gist window. Called every HCM_REBUILD tokens (amortized). n_pos =
-   total stored. Tiers: 2 = q4 (sink/hot/pinned), 1 = q2 (gist), 0 = evicted.
-   hcm_live[0..hcm_n4) are q4 SLOTS; hcm_live[hcm_n4..hcm_live_n) are q2
-   slots, so attn_worker runs two contiguous tier segments with zero modulo
-   in the hot loop (slots precomputed here). RING: positions are absolute;
-   the KV is a static ring, so every position we keep must be >= n_pos -
-   ring_cap (older slots were recycled). */
+/* rebuild the live index: ALL ring positions [0, n_pos] + agent archive.
+   Called when archive changes. No eviction, no salience, no tiers. */
 static void hcm_rebuild(runstate_t *rs, int n_pos) {
-    const int ring = hcm_ctx_cap - HCM_SINK;   /* recyclable slots */
-    const int oldest = n_pos - ring;           /* first still-alive position */
     const int kvq = (kvq_on == 1);
-    /* tier/salience are slot-indexed (n_ctx-sized): translate every
-       absolute position through hcm_slot */
-    if (!hcm_on || n_pos <= HCM_SINK + HCM_W_HOT) {
-        /* nothing to evict yet: everything live at q4 (all < n_ctx anyway) */
-        for (int p = 0; p < n_pos; p++) {
-            hcm_live[p] = hcm_slot(p, hcm_ctx_cap);
-            hcm_tier[hcm_slot(p, hcm_ctx_cap)] = 2;
-        }
-        hcm_live_n = n_pos;
-        hcm_n4 = n_pos;
-        hcm_n_ring_q4 = n_pos;
-        /* agent archive is still attended during the all-live phase */
-        if (kvq) {
-            for (int e = 0; e < hcm_arc_nent; e++) {
-                if (hcm_arc_ent[e].n <= 0) continue;
-                for (int k = 0; k < hcm_arc_ent[e].n; k++)
-                    hcm_live[hcm_live_n++] = HCM_ARC_BASE + hcm_arc_ent[e].pos + k;
-            }
-            hcm_n4 = hcm_live_n;
-        }
-        if (getenv("HCM_DBG")) fprintf(stderr, "[hcm] n_pos=%d all-live q4 (%d)\n", n_pos, hcm_live_n);
-        return;
-    }
-    /* 1) sink + hot window are always live, q4 (ring slots) */
     int n = 0;
-    int hot_lo = n_pos - HCM_W_HOT;
-    if (hot_lo < oldest) hot_lo = oldest;      /* small ring: clamp to alive */
-    for (int p = 0; p < HCM_SINK && p < hot_lo; p++) {
-        hcm_live[n++] = hcm_slot(p, hcm_ctx_cap);
-        hcm_tier[hcm_slot(p, hcm_ctx_cap)] = 2;
+    int cap = rs->n_ctx;
+    int oldest = n_pos - cap;
+    if (oldest < 0) oldest = 0;
+    for (int p = oldest; p < n_pos; p++) {
+        hcm_live[n++] = hcm_slot(p, cap);
     }
-    for (int p = hot_lo; p < n_pos; p++) {
-        hcm_live[n++] = hcm_slot(p, hcm_ctx_cap);
-        hcm_tier[hcm_slot(p, hcm_ctx_cap)] = 2;
-    }
-    int n_ring_q4 = n;
-
-    /* 2) [moved to after arena/archive so hcm_live[] layout matches
-       attn_worker: ring-q4, arena-q4, archive-q4, q2-gist] */
-
-    /* 3) H2O heavy-hitter arena: still maintained for long-term pin
-       survival across ring wrap, but ring tokens do NOT compete for it.
-       The arena is populated from the hot window only (already q4 above),
-       not from the noisy middle. This keeps the arena useful without
-       dropping random ring tokens. */
-    if (kvq) {
-        /* promote hot-window tokens that have high salience into the arena
-           for ring-wrap protection. Only hot-window candidates, not the
-           noisy middle, so the selection is stable. */
-        typedef struct { float sc; int pos; } hcm_ent;
-        static hcm_ent *heap = NULL;
-        static int heap_cap = 0;
-        if (heap_cap < HCM_H_PIN) {
-            free(heap);
-            heap = malloc((size_t)HCM_H_PIN * sizeof(hcm_ent));
-            heap_cap = HCM_H_PIN;
-        }
-        int hn = 0;
-        
-#define HCM_PUSH(SC, POS) do { \
-        if (hn < HCM_H_PIN) { \
-            int i = hn++; \
-            heap[i].sc = (SC); heap[i].pos = (POS); \
-            while (i > 0) { int par = (i-1)/2; if (heap[par].sc <= heap[i].sc) break; \
-                hcm_ent t = heap[par]; heap[par] = heap[i]; heap[i] = t; i = par; } \
-        } else if ((SC) > heap[0].sc) { \
-            heap[0].sc = (SC); heap[0].pos = (POS); \
-            int i = 0; \
-            for (;;) { int lc = 2*i+1, rc = 2*i+2, sm = i; \
-                if (lc < hn && heap[lc].sc < heap[sm].sc) sm = lc; \
-                if (rc < hn && heap[rc].sc < heap[sm].sc) sm = rc; \
-                if (sm == i) break; hcm_ent t = heap[sm]; heap[sm] = heap[i]; heap[i] = t; i = sm; } \
-        } \
-    } while (0)
-        for (int p = hot_lo; p < n_pos; p++) {
-            const int s = hcm_slot(p, hcm_ctx_cap);
-            float sc = 0.0f;
-            for (int l = 0; l < N_ATTN_LAYER; l++) sc += hcm_sal[l][s];
-            HCM_PUSH(sc, p);
-        }
-        /* existing arena occupants compete to stay */
-        for (int a = 0; a < HCM_H_PIN; a++) {
-            if (hcm_pin_pos[a] < 0) continue;
-            float sc = 0.0f;
-            for (int l = 0; l < N_ATTN_LAYER; l++) sc += hcm_pin_sal[l][a];
-            HCM_PUSH(sc, -1 - a);  /* negative pos encodes arena idx */
-        }
-#undef HCM_PUSH
-        int new_arena[HCM_H_PIN];
-        for (int i = 0; i < hn; i++) new_arena[i] = -1;
-        for (int i = 0; i < hn; i++) {
-            if (heap[i].pos < 0) new_arena[i] = -1 - heap[i].pos;
-        }
-        for (int i = 0; i < hn; i++) {
-            if (heap[i].pos < 0) continue;  /* already an arena occupant */
-            const int src = hcm_slot(heap[i].pos, hcm_ctx_cap);
-            int slot = -1;
-            for (int a = 0; a < HCM_H_PIN; a++) if (hcm_pin_pos[a] < 0) { slot = a; break; }
-            if (slot < 0) {
-                float worst = 1e30f; int wi = -1;
-                for (int a = 0; a < HCM_H_PIN; a++) {
-                    if (hcm_pin_pos[a] < 0) continue;
-                    int kept = 0;
-                    for (int k = 0; k < hn; k++) if (new_arena[k] == a) { kept = 1; break; }
-                    if (kept) continue;
-                    float sc = 0.0f;
-                    for (int l = 0; l < N_ATTN_LAYER; l++) sc += hcm_pin_sal[l][a];
-                    if (sc < worst) { worst = sc; wi = a; }
-                }
-                slot = wi;
-            }
-            if (slot < 0) continue;
-            new_arena[i] = slot;
-            for (int l = 0; l < N_ATTN_LAYER; l++) {
-                uint8_t *dst = hcm_pin_kv[l];
-                const uint8_t *ringb = (const uint8_t *)rs->kv_cache[l];
-                size_t pstride = (size_t)hcm_ctx_cap * KVQ_SLOT;
-                for (int kh = 0; kh < 2 * N_HEAD_KV; kh++) {
-                    const uint8_t *srcp = ringb + (size_t)kh * pstride
-                                                + (size_t)src * KVQ_SLOT;
-                    uint8_t *dstp = dst + (size_t)kh * HCM_H_PIN * KVQ_SLOT
-                                         + (size_t)slot * KVQ_SLOT;
-                    memcpy(dstp, srcp, KVQ_SLOT);
-                }
-            }
-            for (int l = 0; l < N_ATTN_LAYER; l++) hcm_pin_sal[l][slot] = hcm_sal[l][src];
-            hcm_pin_pos[slot] = heap[i].pos;
-        }
-        hcm_pin_n = 0;
-        for (int i = 0; i < hn; i++)
-            if (new_arena[i] >= 0) hcm_pin_n++;
-        for (int i = 0; i < hn; i++) {
-            if (new_arena[i] < 0) continue;
-            hcm_live[n++] = HCM_ARENA_BASE + new_arena[i];
-        }
-    }
-
-    /* 4) agent archive: memory the model pinned itself — always q4, always
-       attended, never evicted. Emitted into the q4 segment. */
     if (kvq) {
         for (int e = 0; e < hcm_arc_nent; e++) {
             if (hcm_arc_ent[e].n <= 0) continue;
@@ -1447,79 +1242,52 @@ static void hcm_rebuild(runstate_t *rs, int n_pos) {
                 hcm_live[n++] = HCM_ARC_BASE + hcm_arc_ent[e].pos + k;
         }
     }
-
-    /* 2) Everything else still physically inside the ring buffer is q2,
-       ALWAYS live — no top-K salience competition, no silent dropping.
-       The EMA salience is too noisy and causes random tokens to be lost.
-       Once a token ages past ring capacity (n_ctx) it is genuinely gone
-       (standard sliding-window), not heuristically evicted. */
-    int cand_lo = HCM_SINK;
-    if (oldest > cand_lo) cand_lo = oldest;
-    for (int p = cand_lo; p < hot_lo; p++) {
-        const int s = hcm_slot(p, hcm_ctx_cap);
-        hcm_live[n++] = s;
-        hcm_tier[s] = 1;                       /* q2 gist, but LIVE */
-    }
-
     hcm_live_n = n;
-    hcm_n4 = n_ring_q4 + (kvq ? hcm_pin_n : 0) + (kvq ? hcm_arc_n : 0);
-    hcm_n_ring_q4 = n_ring_q4;
+    hcm_n4 = n;  /* all q4 (archive is q4, ring is all q4 now) */
+    hcm_n_ring_q4 = n - (kvq ? hcm_arc_n : 0);
     if (getenv("HCM_DBG")) fprintf(stderr,
-        "[hcm] n_pos=%d live=%d (ring-q4=%d pin=%d arc=%d q2=%d) oldest=%d\n",
-        n_pos, hcm_live_n, n_ring_q4, kvq ? hcm_pin_n : 0, kvq ? hcm_arc_n : 0,
-        hcm_live_n - n_ring_q4 - (kvq ? hcm_pin_n : 0) - (kvq ? hcm_arc_n : 0), oldest);
+        "[hcm] n_pos=%d live=%d (ring=%d arc=%d)\n",
+        n_pos, hcm_live_n, hcm_n_ring_q4, kvq ? hcm_arc_n : 0);
 }
+
+/* hcm_save/hcm_load: only persist the agent archive */
 int hcm_save(const char *path) {
-    if (!hcm_on || hcm_ctx_cap <= 0) return 0;
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
-    uint32_t nc = (uint32_t)hcm_ctx_cap;
-    fwrite(&nc, 4, 1, f);
+    uint32_t magic = 0x48434D41; /* 'AHMC' */
+    uint32_t nent = (uint32_t)hcm_arc_nent;
+    uint32_t n = (uint32_t)hcm_arc_n;
+    fwrite(&magic, 4, 1, f);
+    fwrite(&nent, 4, 1, f);
+    fwrite(&n, 4, 1, f);
+    fwrite(hcm_arc_ent, sizeof(hcm_arc_ent_t), HCM_ARC_ENTRIES, f);
     for (int l = 0; l < N_ATTN_LAYER; l++)
-        fwrite(hcm_sal[l], sizeof(float), (size_t)hcm_ctx_cap, f);
-    fwrite(hcm_pin_pos, sizeof(int32_t), HCM_H_PIN, f);
-    for (int l = 0; l < N_ATTN_LAYER; l++)
-        fwrite(hcm_pin_sal[l], sizeof(float), HCM_H_PIN, f);
-    for (int l = 0; l < N_ATTN_LAYER; l++)
-        if (hcm_pin_kv[l])
-            fwrite(hcm_pin_kv[l], (size_t)2 * N_HEAD_KV * HCM_H_PIN, KVQ_SLOT, f);
+        if (hcm_arc_kv[l])
+            fwrite(hcm_arc_kv[l], (size_t)2 * N_HEAD_KV * hcm_arc_n, KVQ_SLOT, f);
     fclose(f);
     return 0;
 }
 
 int hcm_load(const char *path, int n_ctx) {
-    if (!hcm_on) return 0;
-    hcm_init(n_ctx);
+    (void)n_ctx;
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
-    uint32_t nc = 0;
-    if (fread(&nc, 4, 1, f) != 1 || (int)nc != n_ctx) { fclose(f); return -1; }
+    uint32_t magic, nent, n;
+    if (fread(&magic, 4, 1, f) != 1 || magic != 0x48434D41) { fclose(f); return -1; }
+    if (fread(&nent, 4, 1, f) != 1 || fread(&n, 4, 1, f) != 1) { fclose(f); return -1; }
+    if (nent > HCM_ARC_ENTRIES || n > HCM_ARC_MAX) { fclose(f); return -1; }
+    if (fread(hcm_arc_ent, sizeof(hcm_arc_ent_t), HCM_ARC_ENTRIES, f) != HCM_ARC_ENTRIES) {
+        fclose(f); return -1;
+    }
     for (int l = 0; l < N_ATTN_LAYER; l++) {
-        if (fread(hcm_sal[l], sizeof(float), (size_t)n_ctx, f) != (size_t)n_ctx) {
+        if (!hcm_arc_kv[l]) continue;
+        if (fread(hcm_arc_kv[l], (size_t)2 * N_HEAD_KV * n, KVQ_SLOT, f) !=
+            (size_t)(2 * N_HEAD_KV * n * KVQ_SLOT)) {
             fclose(f); return -1;
         }
     }
-    /* arena section is optional (older files lack it) */
-    long pos0 = ftell(f);
-    if (fread(hcm_pin_pos, sizeof(int32_t), HCM_H_PIN, f) != (size_t)HCM_H_PIN) {
-        fseek(f, pos0, SEEK_SET); memset(hcm_pin_pos, -1, sizeof(hcm_pin_pos));
-        hcm_pin_n = 0; fclose(f); return 0;
-    }
-    for (int l = 0; l < N_ATTN_LAYER; l++)
-        if (fread(hcm_pin_sal[l], sizeof(float), HCM_H_PIN, f) != (size_t)HCM_H_PIN) {
-            fclose(f); memset(hcm_pin_pos, -1, sizeof(hcm_pin_pos));
-            hcm_pin_n = 0; return 0;
-        }
-    for (int l = 0; l < N_ATTN_LAYER; l++) {
-        if (!hcm_pin_kv[l]) continue;
-        if (fread(hcm_pin_kv[l], (size_t)2 * N_HEAD_KV * HCM_H_PIN, KVQ_SLOT, f) !=
-            (size_t)(2 * N_HEAD_KV * HCM_H_PIN * KVQ_SLOT)) {
-            fclose(f); memset(hcm_pin_pos, -1, sizeof(hcm_pin_pos));
-            hcm_pin_n = 0; return 0;
-        }
-    }
-    hcm_pin_n = 0;
-    for (int a = 0; a < HCM_H_PIN; a++) if (hcm_pin_pos[a] >= 0) hcm_pin_n++;
+    hcm_arc_nent = (int)nent;
+    hcm_arc_n = (int)n;
     fclose(f);
     return 0;
 }
@@ -1592,13 +1360,11 @@ static int hcm_arc_embed(qma_t *m, runstate_t *rs, int n_threads,
 /* after the entry table is updated, make the archive visible immediately */
 static void hcm_arc_touch(runstate_t *rs) {
     hcm_rebuild(rs, rs->n_pos);
-    hcm_rebuilt_at = rs->n_pos;
-    hcm_next_rebuild = rs->n_pos + HCM_REBUILD;
 }
 
 int hcm_archive_write(qma_t *m, runstate_t *rs, const char *key,
                       const char *content, int n_threads) {
-    if (!hcm_on || qma_kvq_on() != 1) return -2;   /* archive needs the q4 KV path */
+    if (qma_kvq_on() != 1) return -2;   /* archive needs the q4 KV path */
     int old = hcm_arc_find(key);
     if (old >= 0) hcm_arc_ent[old].n = 0;          /* lazy free */
     if (hcm_arc_nent >= HCM_ARC_ENTRIES || hcm_arc_n + 16 > HCM_ARC_MAX) {
@@ -1627,7 +1393,7 @@ int hcm_archive_write(qma_t *m, runstate_t *rs, const char *key,
 
 int hcm_archive_append(qma_t *m, runstate_t *rs, const char *key,
                        const char *content, int n_threads) {
-    if (!hcm_on || qma_kvq_on() != 1) return -2;
+    if (qma_kvq_on() != 1) return -2;
     int e = hcm_arc_find(key);
     if (e < 0) return hcm_archive_write(m, rs, key, content, n_threads);
     /* appending writes at the entry's end — that range must be free, i.e.
@@ -1696,7 +1462,7 @@ static inline float f32_kvdot(const float *q, const float *kp, int hd) {
 
 static void attn_worker(void *arg, int i0, int i1) {
     attn_ctx *c = arg;
-    size_t need_scores = (size_t)(c->n_ctx + 512);
+    size_t need_scores = (size_t)(c->n_live + 512);
     if (need_scores > t_attn_scores_cap) {
         free(t_attn_scores);
         t_attn_scores = malloc(sizeof(float) * need_scores);
@@ -1705,13 +1471,10 @@ static void attn_worker(void *arg, int i0, int i1) {
     float *scores = t_attn_scores;
     const int hd = N_EMBD_HEAD;
     const float scale = 1.0f / sqrtf((float)hd);
-    const int lay = c->lay;   /* attention layer index for salience */
-    const int kvq = (kvq_on == 1);   /* quantized KV path */
+    const int kvq = (kvq_on == 1);
     const uint8_t *cbase = (const uint8_t *)c->cache;
     const uint8_t *ring_lo = cbase;
     const uint8_t *ring_hi = cbase + (size_t)2 * N_HEAD_KV * c->n_ctx * KVQ_SLOT;
-    const uint8_t *pin_lo = c->pin_kv;
-    const uint8_t *pin_hi = c->pin_kv ? c->pin_kv + (size_t)2 * N_HEAD_KV * HCM_H_PIN * KVQ_SLOT : NULL;
     const uint8_t *arc_lo = c->arc_kv;
     const uint8_t *arc_hi = c->arc_kv ? c->arc_kv + (size_t)2 * N_HEAD_KV * HCM_ARC_MAX * KVQ_SLOT : NULL;
 #define KP_CHECK(kp, lo, hi, label, idxval) do { \
@@ -1725,140 +1488,65 @@ static void attn_worker(void *arg, int i0, int i1) {
         const int kh = h / (N_HEAD / N_HEAD_KV);
         float *Kc = c->cache + (size_t)kh * c->n_ctx * hd;
         float *Vc = c->cache + (size_t)(N_HEAD_KV + kh) * c->n_ctx * hd;
-        /* kvq byte slabs: K head kh at kh*n_ctx*KVQ_SLOT, V after */
         const uint8_t *Ks = kvq ? cbase + (size_t)kh * c->n_ctx * KVQ_SLOT : NULL;
         const uint8_t *Vs = kvq ? cbase + (size_t)(N_HEAD_KV + kh) * c->n_ctx * KVQ_SLOT : NULL;
-        /* H2O arena (kvq): K head kh at kh*HCM_H_PIN*KVQ_SLOT, V after */
-        const uint8_t *ApK = kvq && c->pin_kv ? c->pin_kv + (size_t)kh * HCM_H_PIN * KVQ_SLOT : NULL;
-        const uint8_t *ApV = kvq && c->pin_kv ? c->pin_kv + (size_t)(N_HEAD_KV + kh) * HCM_H_PIN * KVQ_SLOT : NULL;
-        /* agent archive (always q4): K head kh at kh*HCM_ARC_MAX*KVQ_SLOT */
         const uint8_t *ArK = kvq && c->arc_kv ? c->arc_kv + (size_t)kh * HCM_ARC_MAX * KVQ_SLOT : NULL;
         const uint8_t *ArV = kvq && c->arc_kv ? c->arc_kv + (size_t)(N_HEAD_KV + kh) * HCM_ARC_MAX * KVQ_SLOT : NULL;
-        float *sal = hcm_on ? hcm_sal[lay] : NULL;
         if (kvqi8_on < 0)
             kvqi8_on = getenv("QMA_KVQI8") == NULL || getenv("QMA_KVQI8")[0] != '0';
-        /* int8-quantized query scratch (one per head-token; the SDOT score
-           kernel then runs per slot without re-widening K nibbles) */
         static _Thread_local int8_t  t_qi8[N_EMBD_HEAD];
         static _Thread_local float   t_qxs[N_EMBD_HEAD / 32];
         static _Thread_local int     t_qsum[N_EMBD_HEAD / 32];
         const int use_i8 = kvq && kvqi8_on;
-        /* i8 scores win once enough slots amortize the one-off query
-           quantization; at tiny attended counts fp32 expansion is cheaper */
         enum { KVQI8_MIN_SLOTS = 64 };
         for (int t = 0; t < c->T; t++) {
             const int abs = c->n_pos + t;
             const float *q = c->Q + (size_t)t * WQ_DIM + (size_t)h * (hd * 2);
-            const int nl_est = (hcm_on && c->n_live > 0) ? c->n_live : (abs + 1);
-            const int nk_est = nl_est + (abs - (hcm_on ? hcm_rebuilt_at : 0) + 1);
+            const int nl = c->n_live;  /* all positions in hcm_live are valid */
+            const int nk_est = nl;
             const int i8_here = use_i8 && nk_est >= KVQI8_MIN_SLOTS;
             if (i8_here) kvq_q_quant(q, hd, t_qi8, t_qxs, t_qsum);
             const int8_t *qi8 = i8_here ? t_qi8 : NULL;
             const float   *qsx = i8_here ? t_qxs : NULL;
             const int     *qss = i8_here ? t_qsum : NULL;
-            /* K/V were appended to the cache by the caller (see
-               kv_append below) before the parallel head loop ran.
-               Attention reads the LIVE index (sink + hot + pinned + gist)
-               instead of every position 0..abs — this is what caps the
-               O(n) growth. New positions in this batch (>= n_pos) are
-               always live. */
-            const int nl = (hcm_on && c->n_live > 0) ? c->n_live : (abs + 1);
-            const int use_live = (hcm_on && c->n_live > 0);
             float maxs = -1e30f;
-            if (use_live) {
-                /* three contiguous segments, no per-position branch:
-                   [0,n_ring_q4) ring q4, [n_ring_q4,n4) arena q4 (H2O
-                   protected heavy hitters), [n4,nl) ring q2 gist. */
-                const int n4 = c->n4;
-                const int n_rq = c->n_ring_q4;
-                if (kvq) {
-                    int j = 0;
-                    for (; j < n_rq && j < nl; j++) {
-                        const int sl = hcm_live[j];   /* ring slot */
-                        const uint8_t *kp = Ks + (size_t)sl * KVQ_SLOT;
-                        KP_CHECK(kp, ring_lo, ring_hi, "ring-q4", sl);
-                        float s = (qi8 ? kvq4_dot_q8(kp, qi8, qsx, qss, hd)
-                                   : kvq4_dot(kp, q, hd)) * scale;
-                        scores[j] = s;
-                        if (s > maxs) maxs = s;
-                    }
-                    for (; j < n4 && j < nl; j++) {
-                        /* arena segment: H2O pin entries (HCM_ARENA_BASE) and
-                           agent-archive entries (HCM_ARC_BASE) — one predictable
-                           branch per position, both q4 */
-                        const int v = hcm_live[j];
-                        const uint8_t *ak = v >= HCM_ARC_BASE ? ArK : ApK;
-                        const int a = v - (v >= HCM_ARC_BASE ? HCM_ARC_BASE : HCM_ARENA_BASE);
-                        const uint8_t *kp = ak + (size_t)a * KVQ_SLOT;
-                        KP_CHECK(kp, (v >= HCM_ARC_BASE ? arc_lo : pin_lo),
-                                     (v >= HCM_ARC_BASE ? arc_hi : pin_hi),
-                                     (v >= HCM_ARC_BASE ? "archive" : "pin-arena"), a);
-                        float s = (qi8 ? kvq4_dot_q8(kp, qi8, qsx, qss, hd)
-                                   : kvq4_dot(kp, q, hd)) * scale;
-                        scores[j] = s;
-                        if (s > maxs) maxs = s;
-                    }
-                    for (; j < nl; j++) {
-                        const int sl = hcm_live[j];   /* ring slot */
-                        const uint8_t *kp = Ks + (size_t)sl * KVQ_SLOT + KVQ2_OFF;
-                        KP_CHECK(kp - KVQ2_OFF, ring_lo, ring_hi, "ring-q2", sl);
-                        float s = kvq2_dot(kp, q, hd) * scale;
-                        scores[j] = s;
-                        if (s > maxs) maxs = s;
-                    }
-                } else {
-                    for (int j = 0; j < nl; j++) {
-                        const int sl = hcm_live[j];   /* ring slot (fp32: no arena) */
-                        const float *kp = Kc + (size_t)sl * hd;
-                        float s = f32_kvdot(q, kp, hd) * scale;
-                        scores[j] = s;
-                        if (s > maxs) maxs = s;
-                    }
-                }
-                /* positions appended since the last rebuild — the live
-                   index does not cover [rebuilt_at, n_pos), so attend them
-                   directly. Includes the current batch AND any tokens
-                   generated between rebuilds (e.g. the previous turn's
-                   reply). Without this, multi-turn would lose everything
-                   written since the last 128-token rebuild. */
-                const int batch_lo = c->rebuilt_at;
-                for (int p = batch_lo; p <= abs; p++) {
-                    float s;
-                    if (kvq) {
-                        const uint8_t *kp = Ks + (size_t)hcm_slot(p, c->n_ctx) * KVQ_SLOT;
-                        KP_CHECK(kp, ring_lo, ring_hi, "batch-lo", hcm_slot(p, c->n_ctx));
-                        s = (qi8 ? kvq4_dot_q8(kp, qi8, qsx, qss, hd)
+            /* hcm_live[0..hcm_n_ring_q4) = ring slots (q4)
+               hcm_live[hcm_n_ring_q4..hcm_live_n) = archive entries (q4, HCM_ARC_BASE) */
+            const int n_rq = c->n_ring_q4;
+            if (kvq) {
+                int j = 0;
+                for (; j < n_rq && j < nl; j++) {
+                    const int sl = hcm_live[j];
+                    const uint8_t *kp = Ks + (size_t)sl * KVQ_SLOT;
+                    KP_CHECK(kp, ring_lo, ring_hi, "ring-q4", sl);
+                    float s = (qi8 ? kvq4_dot_q8(kp, qi8, qsx, qss, hd)
                                : kvq4_dot(kp, q, hd)) * scale;
-                    } else {
-                        const float *kp = Kc + (size_t)hcm_slot(p, c->n_ctx) * hd;
-                        s = f32_kvdot(q, kp, hd) * scale;
-                    }
-                    scores[nl + (p - batch_lo)] = s;
+                    scores[j] = s;
+                    if (s > maxs) maxs = s;
+                }
+                for (; j < nl; j++) {
+                    const int v = hcm_live[j];
+                    const uint8_t *ak = ArK;
+                    const int a = v - HCM_ARC_BASE;
+                    const uint8_t *kp = ak + (size_t)a * KVQ_SLOT;
+                    KP_CHECK(kp, arc_lo, arc_hi, "archive", a);
+                    float s = (qi8 ? kvq4_dot_q8(kp, qi8, qsx, qss, hd)
+                               : kvq4_dot(kp, q, hd)) * scale;
+                    scores[j] = s;
                     if (s > maxs) maxs = s;
                 }
             } else {
-                /* dense: every position 0..abs (HCM disabled or pre-first
-                   rebuild). kvq slots are all-q4 here (new tokens). */
-                for (int p = 0; p <= abs; p++) {
-                    float s;
-                    if (kvq) {
-                        const uint8_t *kp = Ks + (size_t)hcm_slot(p, c->n_ctx) * KVQ_SLOT;
-                        KP_CHECK(kp, ring_lo, ring_hi, "dense", hcm_slot(p, c->n_ctx));
-                        s = (qi8 ? kvq4_dot_q8(kp, qi8, qsx, qss, hd)
-                               : kvq4_dot(kp, q, hd)) * scale;
-                    } else {
-                        const float *kp = Kc + (size_t)hcm_slot(p, c->n_ctx) * hd;
-                        s = f32_kvdot(q, kp, hd) * scale;
-                    }
-                    scores[p] = s;
+                for (int j = 0; j < nl; j++) {
+                    const int sl = hcm_live[j];
+                    const float *kp = Kc + (size_t)sl * hd;
+                    float s = f32_kvdot(q, kp, hd) * scale;
+                    scores[j] = s;
                     if (s > maxs) maxs = s;
                 }
             }
-            const int nk = use_live ? (nl + (abs - c->rebuilt_at + 1)) : (abs + 1);
+            const int nk = nl;
             float sum = 0.0f;
             {
-                /* vectorized softmax: scores are contiguous; subtract max,
-                   exp in NEON, accumulate the normalizer */
                 const float32x4_t vmax = vdupq_n_f32(maxs);
                 float32x4_t sacc = vdupq_n_f32(0.0f);
                 int j = 0;
@@ -1872,93 +1560,33 @@ static void attn_worker(void *arg, int i0, int i1) {
                 for (; j < nk; j++) { scores[j] = expf(scores[j] - maxs); sum += scores[j]; }
             }
             float *o = c->out + (size_t)t * WO_DIM + (size_t)h * hd;
-            /* NEON weighted V accumulation + salience EMA fusion: one walk
-               over the live segments does both the weighted V sum AND the
-               H2O heavy-hitter update (previously a second full segment
-               walk with a division per entry; now 1/sum precomputed). */
-            {
-                const float inv = 1.0f / sum;
-                const int do_sal = sal && use_live;
-                float32x4_t oacc[64];  /* hd/4 = 64 */
-                for (int d4 = 0; d4 < hd / 4; d4++) oacc[d4] = vdupq_n_f32(0.0f);
-                float *oaccf = (float *)oacc;
-                if (use_live) {
-                    const int n4 = c->n4;
-                    const int n_rq = c->n_ring_q4;
-                    int j = 0;
-                    if (kvq) {
-                        for (; j < n_rq && j < nl; j++) {
-                            const int sl = hcm_live[j];   /* ring slot */
-                            kvq4_vacc(Vs + (size_t)sl * KVQ_SLOT,
-                                      scores[j], oaccf, hd);
-                            if (do_sal)
-                                sal[sl] += HCM_ALPHA * (scores[j] * inv - sal[sl]);
-                        }
-                        for (; j < n4 && j < nl; j++) {
-                            const int v = hcm_live[j];   /* pin or agent arena */
-                            const uint8_t *av = v >= HCM_ARC_BASE ? ArV : ApV;
-                            const int a = v - (v >= HCM_ARC_BASE ? HCM_ARC_BASE : HCM_ARENA_BASE);
-                            kvq4_vacc(av + (size_t)a * KVQ_SLOT,
-                                      scores[j], oaccf, hd);
-                            /* pinned facts keep competing for the top set;
-                               agent-archive entries have no salience */
-                            if (do_sal && v < HCM_ARC_BASE)
-                                hcm_pin_sal[lay][a] +=
-                                    HCM_ALPHA * (scores[j] * inv - hcm_pin_sal[lay][a]);
-                        }
-                        for (; j < nl; j++) {
-                            const int sl = hcm_live[j];   /* ring slot */
-                            kvq2_vacc(Vs + (size_t)sl * KVQ_SLOT + KVQ2_OFF,
-                                      scores[j], oaccf, hd);
-                            if (do_sal)
-                                sal[sl] += HCM_ALPHA * (scores[j] * inv - sal[sl]);
-                        }
-                    } else {
-                        for (int j = 0; j < nl; j++) {
-                            const int sl = hcm_live[j];   /* ring slot (fp32) */
-                            const float sp = scores[j];
-                            const float *vp = Vc + (size_t)sl * hd;
-                            float32x4_t spv = vdupq_n_f32(sp);
-                            for (int d4 = 0; d4 < hd / 4; d4++)
-                                oacc[d4] = vmlaq_f32(oacc[d4], spv, vld1q_f32(vp + d4 * 4));
-                            if (do_sal)
-                                sal[sl] += HCM_ALPHA * (sp * inv - sal[sl]);
-                        }
-                    }
-                    /* post-rebuild tail + current batch: all q4 */
-                    const int batch_lo = c->rebuilt_at;
-                    for (int p = batch_lo; p <= abs; p++) {
-                        const float sp = scores[nl + (p - batch_lo)];
-                        const int sl = hcm_slot(p, c->n_ctx);
-                        if (kvq) {
-                            kvq4_vacc(Vs + (size_t)sl * KVQ_SLOT,
-                                      sp, oaccf, hd);
-                        } else {
-                            const float *vp = Vc + (size_t)sl * hd;
-                            float32x4_t spv = vdupq_n_f32(sp);
-                            for (int d4 = 0; d4 < hd / 4; d4++)
-                                oacc[d4] = vmlaq_f32(oacc[d4], spv, vld1q_f32(vp + d4 * 4));
-                        }
-                        if (do_sal)
-                            sal[sl] += HCM_ALPHA * (sp * inv - sal[sl]);
-                    }
-                } else {
-                    for (int p = 0; p <= abs; p++) {
-                        const float sp = scores[p];
-                        if (kvq) {
-                            kvq4_vacc(Vs + (size_t)hcm_slot(p, c->n_ctx) * KVQ_SLOT,
-                                      sp, oaccf, hd);
-                        } else {
-                            const float *vp = Vc + (size_t)hcm_slot(p, c->n_ctx) * hd;
-                            float32x4_t spv = vdupq_n_f32(sp);
-                            for (int d4 = 0; d4 < hd / 4; d4++)
-                                oacc[d4] = vmlaq_f32(oacc[d4], spv, vld1q_f32(vp + d4 * 4));
-                        }
-                    }
+            const float inv = 1.0f / sum;
+            float32x4_t oacc[64];
+            for (int d4 = 0; d4 < hd / 4; d4++) oacc[d4] = vdupq_n_f32(0.0f);
+            float *oaccf = (float *)oacc;
+            if (kvq) {
+                int j = 0;
+                for (; j < n_rq && j < nl; j++) {
+                    const int sl = hcm_live[j];
+                    kvq4_vacc(Vs + (size_t)sl * KVQ_SLOT, scores[j], oaccf, hd);
                 }
-                for (int d4 = 0; d4 < hd / 4; d4++)
-                    vst1q_f32(o + d4 * 4, vmulq_n_f32(oacc[d4], inv));
+                for (; j < nl; j++) {
+                    const int v = hcm_live[j];
+                    const int a = v - HCM_ARC_BASE;
+                    kvq4_vacc(ArV + (size_t)a * KVQ_SLOT, scores[j], oaccf, hd);
+                }
+            } else {
+                for (int j = 0; j < nl; j++) {
+                    const int sl = hcm_live[j];
+                    const float sp = scores[j];
+                    const float *vp = Vc + (size_t)sl * hd;
+                    float32x4_t spv = vdupq_n_f32(sp);
+                    for (int d4 = 0; d4 < hd / 4; d4++)
+                        oacc[d4] = vmlaq_f32(oacc[d4], spv, vld1q_f32(vp + d4 * 4));
+                }
             }
+            for (int d4 = 0; d4 < hd / 4; d4++)
+                vst1q_f32(o + d4 * 4, vmulq_n_f32(oacc[d4], inv));
         }
     }
 #undef KP_CHECK
@@ -1966,11 +1594,7 @@ static void attn_worker(void *arg, int i0, int i1) {
 
 /* append K/V for all kv heads at the given positions (must run before the
    parallel attention so GQA readers never race the writer). With kvq on,
-   each position slot stores BOTH the q4 (offset 0) and q2 (offset KVQ2_OFF)
-   records, quantized from the same fp32 — tier transitions are tag flips.
-   RING: the KV is a static ring; positions map to slots via hcm_slot. When
-   a slot is recycled (new position overwrites an old one), its salience
-   and tier are reset — the ring turning IS the eviction. */
+   each position slot stores the q4 record. Ring buffer: slot = pos % n_ctx. */
 static void kv_append(const attn_ctx *c) {
     const int hd = N_EMBD_HEAD;
     const int kvq = (kvq_on == 1);
@@ -1978,25 +1602,6 @@ static void kv_append(const attn_ctx *c) {
     for (int t = 0; t < c->T; t++) {
         const int abs = c->n_pos + t;
         const int slot = hcm_slot(abs, c->n_ctx);
-        /* Q-Hitter QF: average relative q4 error of K and V for this token
-           (lower = quantizes better). Stored per slot; the H2O pin selection
-           prefers quantization-friendly tokens so the q4/q2 tiers hold
-           higher-fidelity KV. Zero on recycled slots = unknown, treated as
-           neutral in selection. */
-        if (kvq && hcm_on) {
-            float qf_k = 0, qf_v = 0;
-            for (int kh = 0; kh < N_HEAD_KV; kh++) {
-                const uint8_t *Kslot = cbase + (size_t)kh * c->n_ctx * KVQ_SLOT
-                                             + (size_t)slot * KVQ_SLOT;
-                const uint8_t *Vslot = cbase + (size_t)(N_HEAD_KV + kh) * c->n_ctx * KVQ_SLOT
-                                             + (size_t)slot * KVQ_SLOT;
-                const float *kv = c->K + (size_t)t * WKV_DIM + (size_t)kh * hd;
-                const float *vv = c->V + (size_t)t * WKV_DIM + (size_t)kh * hd;
-                qf_k += kvq4_qf(Kslot, kv, hd);
-                qf_v += kvq4_qf(Vslot, vv, hd);
-            }
-            hcm_qf[slot] = (qf_k + qf_v) / (2.0f * N_HEAD_KV);
-        }
         for (int kh = 0; kh < N_HEAD_KV; kh++) {
             if (kvq) {
                 uint8_t *Kslot = cbase + (size_t)kh * c->n_ctx * KVQ_SLOT
@@ -2005,10 +1610,8 @@ static void kv_append(const attn_ctx *c) {
                                          + (size_t)slot * KVQ_SLOT;
                 const float *kv = c->K + (size_t)t * WKV_DIM + (size_t)kh * hd;
                 kvq4_quant(kv, hd, Kslot);
-                kvq2_quant(kv, hd, Kslot);
                 const float *vv = c->V + (size_t)t * WKV_DIM + (size_t)kh * hd;
                 kvq4_quant(vv, hd, Vslot);
-                kvq2_quant(vv, hd, Vslot);
             } else {
                 float *Kc = c->cache + (size_t)kh * c->n_ctx * hd;
                 float *Vc = c->cache + (size_t)(N_HEAD_KV + kh) * c->n_ctx * hd;
@@ -2017,12 +1620,6 @@ static void kv_append(const attn_ctx *c) {
                 const float *vv = c->V + (size_t)t * WKV_DIM + (size_t)kh * hd;
                 memcpy(Vc + (size_t)slot * hd, vv, hd * sizeof(float));
             }
-        }
-        /* recycled slot: this position now owns the slot, so the old
-           occupant's salience/tier must not leak into the new token */
-        if (hcm_on) {
-            hcm_tier[slot] = 2;   /* new tokens start q4 */
-            for (int l = 0; l < N_ATTN_LAYER; l++) hcm_sal[l][slot] = 0.0f;
         }
     }
 }
@@ -2456,10 +2053,10 @@ int runstate_init_kv(runstate_t *rs, int n_ctx, const char *path, int persist) {
            page writeback pressure; pages are discarded under pressure. */
         want_anon = 1;
     } else {
-        /* anonymous temp file in the state dir (large ctx needs the sparse
+        /* anonymous temp file in the working dir (large ctx needs the sparse
            file so storage pages it in/out instead of heap) */
         char tmp[512];
-        snprintf(tmp, sizeof(tmp), "/data/data/com.termux/files/home/projects/qma/inference-engine-moe/.kv-%d", (int)getpid());
+        snprintf(tmp, sizeof(tmp), "./.kv-%d", (int)getpid());
         rs->kv_fd = open(tmp, O_RDWR | O_CREAT | O_TRUNC, 0600);
         if (rs->kv_fd >= 0) {
             if (ftruncate(rs->kv_fd, (off_t)kv_total) == 0) {
@@ -2658,19 +2255,12 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
         if (g_timing) { timing_init(); }
 
         /* hierarchical context memory: init once per runstate, rebuild the
-           live index every HCM_REBUILD tokens (amortized re-rank). The
-           trigger uses the RUNNING position (rs->n_pos + done), not the
-           pre-call value — rs->n_pos is frozen until this eval returns, so
-           a multi-thousand-token prefill used to never re-fire mid-call and
-           the dense "since last rebuild" tail grew to the whole prefill
-           (O(n^2) attention). Rebuilds now re-fire at chunk boundaries, so
-           that tail stays bounded by MAX_CHUNK. */
-        if (hcm_on < 0) hcm_init(rs->n_ctx);
+           live index (ring + archive). Rebuild to include current chunk. */
+        if (hcm_live_n == 0) hcm_init(rs->n_ctx);
         const int pos_now = rs->n_pos + done;
-        if (hcm_on && pos_now >= hcm_next_rebuild) {
-            hcm_rebuild(rs, pos_now);
-            hcm_rebuilt_at = pos_now;
-            hcm_next_rebuild = pos_now + HCM_REBUILD;
+        if (pos_now + T != hcm_rebuilt_at) {
+            hcm_rebuild(rs, pos_now + T);
+            hcm_rebuilt_at = pos_now + T;
         }
 
         for (int il = 0; il < N_LAYER; il++) {
@@ -2736,8 +2326,7 @@ int qma_eval(qma_t *m, runstate_t *rs, const int *tokens, int n_tokens,
                     float *aout = s.gkv; /* [T][6144] */
                     attn_ctx ac = { s.qfull, s.kvK, s.kvV, s.z, aout, rs->kv_cache[il / 4],
                                     T, rs->n_ctx, rs->n_pos + done,
-                                    il / 4, hcm_live_n, hcm_n4, hcm_n_ring_q4,
-                                    hcm_rebuilt_at, hcm_pin_kv[il / 4], hcm_arc_kv[il / 4] };
+                                    hcm_live_n, hcm_n_ring_q4, hcm_arc_kv[il / 4] };
                     if (g_timing) tA = now_s();
                     kv_append(&ac);
                     pool_run(attn_worker, &ac, N_HEAD);
